@@ -1,0 +1,92 @@
+$dirs = @(
+  "frontend/src/app",
+  "frontend/src/components",
+  "frontend/src/services",
+  "frontend/src/hooks",
+  "frontend/src/types",
+  "frontend/src/styles",
+  "frontend/public",
+  "backend/app/api/routes",
+  "backend/app/core",
+  "backend/app/models",
+  "backend/app/schemas",
+  "backend/app/services",
+  "backend/app/repositories",
+  "backend/app/workers",
+  "backend/app/utils",
+  "backend/tests",
+  "ai-service/detector/weights",
+  "ai-service/ocr",
+  "ai-service/preprocessing",
+  "ai-service/pipeline",
+  "ai-service/config",
+  "ai-service/tests",
+  "database/migrations",
+  "database/seeds",
+  "storage/originals",
+  "storage/plates",
+  "storage/annotated",
+  "infrastructure/nginx",
+  "infrastructure/docker",
+  "infrastructure/k8s/api",
+  "infrastructure/k8s/worker",
+  "infrastructure/k8s/frontend",
+  "infrastructure/monitoring/prometheus",
+  "infrastructure/monitoring/grafana",
+  "shared",
+  "scripts",
+  "docs",
+  "tests/integration",
+  "tests/e2e"
+)
+
+foreach ($dir in $dirs) {
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+}
+
+$files = @(
+  "frontend/src/app/.gitkeep",
+  "frontend/src/components/.gitkeep",
+  "frontend/src/services/.gitkeep",
+  "frontend/src/hooks/.gitkeep",
+  "frontend/src/types/.gitkeep",
+  "frontend/src/styles/.gitkeep",
+  "frontend/public/.gitkeep",
+  "backend/app/api/routes/.gitkeep",
+  "backend/app/core/.gitkeep",
+  "backend/app/models/.gitkeep",
+  "backend/app/schemas/.gitkeep",
+  "backend/app/services/.gitkeep",
+  "backend/app/repositories/.gitkeep",
+  "backend/app/workers/.gitkeep",
+  "backend/app/utils/.gitkeep",
+  "backend/tests/.gitkeep",
+  "ai-service/detector/weights/.gitkeep",
+  "ai-service/ocr/.gitkeep",
+  "ai-service/preprocessing/.gitkeep",
+  "ai-service/pipeline/.gitkeep",
+  "ai-service/config/.gitkeep",
+  "ai-service/tests/.gitkeep",
+  "database/migrations/.gitkeep",
+  "database/seeds/.gitkeep",
+  "storage/originals/.gitkeep",
+  "storage/plates/.gitkeep",
+  "storage/annotated/.gitkeep",
+  "infrastructure/nginx/.gitkeep",
+  "infrastructure/docker/.gitkeep",
+  "infrastructure/k8s/api/.gitkeep",
+  "infrastructure/k8s/worker/.gitkeep",
+  "infrastructure/k8s/frontend/.gitkeep",
+  "infrastructure/monitoring/prometheus/.gitkeep",
+  "infrastructure/monitoring/grafana/.gitkeep",
+  "shared/.gitkeep",
+  "docs/.gitkeep",
+  "tests/integration/.gitkeep",
+  "tests/e2e/.gitkeep"
+)
+
+foreach ($file in $files) {
+  New-Item -ItemType File -Force -Path $file | Out-Null
+}
+
+Write-Host "LPR folder structure created."
