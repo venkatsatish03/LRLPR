@@ -1,16 +1,49 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
-import { detectLicensePlate } from "@/services/api";
-import type { DetectionResult } from "@/types/detection";
+import { ChangeEvent, CSSProperties, DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { detectLicensePlateDetails, resolveAssetUrl } from "@/services/api";
+import type { PlateDetection, PlateDetectionResponse } from "@/types/detection";
+
+type ExportDetection = {
+  index: number;
+  plate: string;
+  final_confidence: number;
+  detector_confidence: number;
+  ocr_confidence: number;
+  coordinates: PlateDetection["coordinates"];
+  cropped_plate_url: string;
+  candidates: { plate: string; confidence: number }[];
+};
+
+type InvestigationExport = {
+  exported_at: string;
+  processed_at: string | null;
+  uploaded_file_name: string | null;
+  stored_filename: string;
+  original_image_url: string;
+  annotated_image_url: string | null;
+  detector: string;
+  model_configured: boolean;
+  plates_detected: number;
+  quality_score: number;
+  processing_time_ms: number | null;
+  detections: ExportDetection[];
+};
+
+type QualityStatus = {
+  label: string;
+  tone: "strong" | "review" | "weak" | "empty";
+};
 
 export default function Home() {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string>("");
+  const [previewUrl, setPreviewUrl] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [isDetecting, setIsDetecting] = useState(false);
-  const [result, setResult] = useState<DetectionResult | null>(null);
+  const [result, setResult] = useState<PlateDetectionResponse | null>(null);
+  const [processingTimeMs, setProcessingTimeMs] = useState<number | null>(null);
+  const [processedAt, setProcessedAt] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -25,16 +58,26 @@ export default function Home() {
     return () => URL.revokeObjectURL(objectUrl);
   }, [file]);
 
+  const bestDetection = result?.detections[0] ?? null;
+  const qualityScore = useMemo(() => (result ? calculateQualityScore(result) : 0), [result]);
+  const qualityStatus = getQualityStatus(qualityScore, result?.plates_detected ?? 0);
+  const annotatedImageUrl = resolveAssetUrl(result?.annotated_image_url);
+  const storedOriginalUrl = result ? resolveAssetUrl(`/uploads/${result.filename}`) : "";
+  const originalImageUrl = previewUrl || storedOriginalUrl;
+  const candidateRows = useMemo(() => buildCandidateRows(bestDetection), [bestDetection]);
+
   function handleFile(selectedFile?: File) {
     if (!selectedFile) return;
 
     if (!selectedFile.type.startsWith("image/")) {
-      setError("Please upload an image file.");
+      setError("Unsupported evidence file. Select an image.");
       return;
     }
 
     setFile(selectedFile);
     setResult(null);
+    setProcessingTimeMs(null);
+    setProcessedAt(null);
     setError("");
   }
 
@@ -50,133 +93,560 @@ export default function Home() {
 
   async function handleDetect() {
     if (!file) {
-      setError("Upload a vehicle image first.");
+      setError("Select an evidence image first.");
       return;
     }
 
     setIsDetecting(true);
     setError("");
     setResult(null);
+    setProcessingTimeMs(null);
+    setProcessedAt(null);
 
+    const startTime = performance.now();
     try {
-      const detection = await detectLicensePlate(file);
+      const detection = await detectLicensePlateDetails(file);
+      setProcessingTimeMs(Math.round(performance.now() - startTime));
+      setProcessedAt(new Date().toISOString());
       setResult(detection);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Detection failed.");
+      setError(err instanceof Error ? err.message : "Evidence analysis failed.");
     } finally {
       setIsDetecting(false);
     }
   }
 
+  function clearCase() {
+    setFile(null);
+    setResult(null);
+    setProcessingTimeMs(null);
+    setProcessedAt(null);
+    setError("");
+    if (inputRef.current) inputRef.current.value = "";
+  }
+
+  function downloadJson() {
+    if (!result) return;
+    const payload = createExportPayload(result, file, processingTimeMs, qualityScore, processedAt);
+    downloadBlob(
+      new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
+      buildFilename(result.filename, "json"),
+    );
+  }
+
+  function downloadCsv() {
+    if (!result) return;
+    const payload = createExportPayload(result, file, processingTimeMs, qualityScore, processedAt);
+    downloadBlob(new Blob([createCsv(payload)], { type: "text/csv" }), buildFilename(result.filename, "csv"));
+  }
+
+  function downloadPdf() {
+    if (!result) return;
+    const payload = createExportPayload(result, file, processingTimeMs, qualityScore, processedAt);
+    downloadBlob(createPdf(payload), buildFilename(result.filename, "pdf"));
+  }
+
   return (
-    <main className="page-shell">
-      <section className="workspace">
-        <div className="intro">
-          <p className="eyebrow">LPR System</p>
-          <h1>License Plate Recognition</h1>
-          <p className="subtitle">Upload a vehicle image, preview it, then run plate detection and OCR.</p>
+    <main className="investigation-shell">
+      <header className="command-bar">
+        <div>
+          <p className="eyebrow">LPR Investigation Console</p>
+          <h1>Vehicle Plate Evidence Review</h1>
+        </div>
+        <div className="case-status" aria-label="Case status">
+          <span>{result ? "Analyzed" : file ? "Queued" : "No Evidence"}</span>
+          <strong>{formatDuration(processingTimeMs)}</strong>
+        </div>
+      </header>
+
+      <section className="case-toolbar" aria-label="Evidence controls">
+        <div
+          className={`upload-target ${isDragging ? "is-dragging" : ""}`}
+          onClick={() => inputRef.current?.click()}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={() => setIsDragging(false)}
+          onDrop={handleDrop}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") inputRef.current?.click();
+          }}
+          role="button"
+          tabIndex={0}
+        >
+          <input ref={inputRef} type="file" accept="image/*" onChange={handleInputChange} hidden />
+          <span className="upload-label">Evidence Image</span>
+          <strong>{file?.name ?? "Drop image or browse"}</strong>
         </div>
 
-        <div className="panel-grid">
-          <section className="upload-panel" aria-label="Image upload">
-            <div
-              className={`drop-zone ${isDragging ? "is-dragging" : ""} ${previewUrl ? "has-preview" : ""}`}
-              onClick={() => inputRef.current?.click()}
-              onDragOver={(event) => {
-                event.preventDefault();
-                setIsDragging(true);
-              }}
-              onDragLeave={() => setIsDragging(false)}
-              onDrop={handleDrop}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") inputRef.current?.click();
-              }}
-            >
-              <input ref={inputRef} type="file" accept="image/*" onChange={handleInputChange} hidden />
+        <div className="action-group">
+          <button className="primary-button" type="button" disabled={!file || isDetecting} onClick={handleDetect}>
+            {isDetecting ? "Analyzing" : "Analyze"}
+          </button>
+          <button className="secondary-button" type="button" disabled={!result} onClick={downloadPdf}>
+            PDF
+          </button>
+          <button className="secondary-button" type="button" disabled={!result} onClick={downloadJson}>
+            JSON
+          </button>
+          <button className="secondary-button" type="button" disabled={!result} onClick={downloadCsv}>
+            CSV
+          </button>
+          <button className="ghost-button" type="button" disabled={!file && !result} onClick={clearCase}>
+            Clear
+          </button>
+        </div>
+      </section>
 
-              {previewUrl ? (
-                <img className="preview-image" src={previewUrl} alt="Uploaded vehicle preview" />
-              ) : (
-                <div className="empty-preview">
-                  <div className="upload-icon">+</div>
-                  <p>Drag and drop vehicle image</p>
-                  <span>or click to browse</span>
-                </div>
-              )}
+      {error && <div className="system-message">{error}</div>}
+
+      <div className="dashboard-grid">
+        <div className="visual-column">
+          <section className="panel evidence-panel" aria-label="Evidence imagery">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">Evidence Imagery</p>
+                <h2>Original and Annotated Views</h2>
+              </div>
+              <span className="panel-count">{result?.plates_detected ?? 0} plates</span>
             </div>
 
-            <div className="file-row">
-              <span>{file ? file.name : "No image selected"}</span>
-              {file && (
-                <button
-                  className="text-button"
-                  type="button"
-                  onClick={() => {
-                    setFile(null);
-                    setResult(null);
-                    setError("");
-                    if (inputRef.current) inputRef.current.value = "";
-                  }}
-                >
-                  Clear
-                </button>
-              )}
+            <div className="image-grid">
+              <figure className="image-viewer">
+                <figcaption>Original Image</figcaption>
+                {originalImageUrl ? (
+                  <img src={originalImageUrl} alt="Original vehicle evidence" />
+                ) : (
+                  <div className="empty-image">Awaiting image</div>
+                )}
+              </figure>
+
+              <figure className="image-viewer">
+                <figcaption>Annotated Image</figcaption>
+                {annotatedImageUrl ? (
+                  <img src={annotatedImageUrl} alt="Annotated plate detection result" />
+                ) : (
+                  <div className="empty-image">{result ? "No annotation generated" : "Awaiting analysis"}</div>
+                )}
+              </figure>
             </div>
           </section>
 
-          <section className="result-panel" aria-label="Detection result">
-            <div className="result-header">
+          <section className="panel crop-panel" aria-label="Plate crop previews">
+            <div className="panel-heading">
               <div>
-                <p className="eyebrow">Detection</p>
-                <h2>Plate Result</h2>
+                <p className="eyebrow">Plate Crops</p>
+                <h2>Detected Plate Evidence</h2>
               </div>
-              <button className="detect-button" type="button" disabled={!file || isDetecting} onClick={handleDetect}>
-                {isDetecting ? "Detecting..." : "Detect"}
-              </button>
             </div>
 
-            {error && <div className="message error">{error}</div>}
-
-            {result ? (
-              <div className="result-card">
-                <div>
-                  <span className="label">Detected Plate</span>
-                  <strong className="plate-text">{result.plate || "Not detected"}</strong>
-                </div>
-                <div>
-                  <span className="label">Confidence Score</span>
-                  <strong className="confidence">{Math.round(result.confidence * 100)}%</strong>
-                </div>
-                {result.confidence < 0.8 && (
-                  <div>
-                    <span className="label">Possible Outcomes</span>
-                    <p className="candidate-note">Generated using Indian plate format AA00AA0000.</p>
-                    {result.candidates.length > 0 ? (
-                      <ol className="candidate-list">
-                        {result.candidates.map((candidate) => (
-                          <li key={`${candidate.plate}-${candidate.confidence}`}>
-                            <span>{candidate.plate}</span>
-                            <strong>{Math.round(candidate.confidence * 100)}%</strong>
-                          </li>
-                        ))}
-                      </ol>
-                    ) : (
-                      <p className="muted-text">No alternate plate candidates were generated.</p>
-                    )}
-                  </div>
-                )}
+            {result && result.detections.length > 0 ? (
+              <div className="crop-grid">
+                {result.detections.map((detection, index) => (
+                  <article className="crop-item" key={`${detection.cropped_plate_url}-${index}`}>
+                    <div className="crop-image-frame">
+                      <img src={resolveAssetUrl(detection.cropped_plate_url)} alt={`Plate crop ${index + 1}`} />
+                    </div>
+                    <div className="crop-details">
+                      <div>
+                        <span>Plate {index + 1}</span>
+                        <strong>{detection.text || "Unread"}</strong>
+                      </div>
+                      <div className="mini-metrics">
+                        <span>OCR {formatPercent(detection.ocr_confidence)}</span>
+                        <span>Final {formatPercent(detection.final_confidence)}</span>
+                      </div>
+                      <code>{formatBox(detection)}</code>
+                    </div>
+                  </article>
+                ))}
               </div>
             ) : (
-              <div className="empty-result">
-                <span className="label">Waiting for image</span>
-                <p>Your plate number and confidence score will appear here.</p>
-              </div>
+              <div className="empty-section">{result ? "No plates detected" : "Plate crops will appear after analysis"}</div>
             )}
           </section>
         </div>
-      </section>
+
+        <aside className="analysis-column" aria-label="Analysis summary">
+          <section className="panel summary-panel">
+            <div className="quality-row">
+              <div
+                className={`quality-meter ${qualityStatus.tone}`}
+                style={{ "--score": `${qualityScore}%` } as CSSProperties}
+                aria-label={`Quality score ${qualityScore}%`}
+              >
+                <strong>{qualityScore}</strong>
+                <span>Quality</span>
+              </div>
+              <div className="finding-primary">
+                <span className={`status-pill ${qualityStatus.tone}`}>{qualityStatus.label}</span>
+                <p>Best Candidate</p>
+                <strong>{bestDetection?.text || "No plate"}</strong>
+              </div>
+            </div>
+
+            <div className="confidence-stack">
+              <ConfidenceMeter label="Final Confidence" value={bestDetection?.final_confidence ?? 0} tone="green" />
+              <ConfidenceMeter label="OCR Confidence" value={bestDetection?.ocr_confidence ?? 0} tone="amber" />
+              <ConfidenceMeter label="Detection Confidence" value={bestDetection?.confidence ?? 0} tone="blue" />
+            </div>
+          </section>
+
+          <section className="panel candidate-panel">
+            <div className="panel-heading compact">
+              <div>
+                <p className="eyebrow">Candidates</p>
+                <h2>Ranked Plate Reads</h2>
+              </div>
+            </div>
+            {candidateRows.length > 0 ? (
+              <ol className="candidate-list">
+                {candidateRows.map((candidate, index) => (
+                  <li key={`${candidate.plate}-${candidate.confidence}-${index}`}>
+                    <span>{String(index + 1).padStart(2, "0")}</span>
+                    <strong>{candidate.plate}</strong>
+                    <em>{formatPercent(candidate.confidence)}</em>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <div className="empty-section">No OCR candidates available</div>
+            )}
+          </section>
+
+          <section className="panel metadata-panel">
+            <div className="panel-heading compact">
+              <div>
+                <p className="eyebrow">Metadata</p>
+                <h2>Detection Record</h2>
+              </div>
+            </div>
+            <dl className="metadata-list">
+              <div>
+                <dt>Detector</dt>
+                <dd>{result?.detector ?? "Pending"}</dd>
+              </div>
+              <div>
+                <dt>Model</dt>
+                <dd>{result ? (result.model_configured ? "Configured" : "Fallback") : "Pending"}</dd>
+              </div>
+              <div>
+                <dt>Stored File</dt>
+                <dd>{result?.filename ?? "Pending"}</dd>
+              </div>
+              <div>
+                <dt>Processing Time</dt>
+                <dd>{formatDuration(processingTimeMs)}</dd>
+              </div>
+              <div>
+                <dt>Processed At</dt>
+                <dd>{processedAt ? formatTimestamp(processedAt) : "Pending"}</dd>
+              </div>
+              <div>
+                <dt>Best Box</dt>
+                <dd>{bestDetection ? formatBox(bestDetection) : "Pending"}</dd>
+              </div>
+            </dl>
+          </section>
+        </aside>
+      </div>
     </main>
   );
+}
+
+function ConfidenceMeter({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number;
+  tone: "green" | "amber" | "blue";
+}) {
+  const percent = Math.round(clamp(value, 0, 1) * 100);
+  return (
+    <div className="confidence-row">
+      <div>
+        <span>{label}</span>
+        <strong>{percent}%</strong>
+      </div>
+      <div className="confidence-track" role="meter" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+        <span className={tone} style={{ width: `${percent}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function calculateQualityScore(result: PlateDetectionResponse): number {
+  const best = result.detections[0];
+  if (!best) return 0;
+
+  const textSignal = best.text ? Math.min(best.text.length / 10, 1) : 0;
+  const score = best.final_confidence * 0.55 + best.ocr_confidence * 0.25 + best.confidence * 0.15 + textSignal * 0.05;
+  return Math.round(clamp(score, 0, 1) * 100);
+}
+
+function getQualityStatus(score: number, platesDetected: number): QualityStatus {
+  if (platesDetected === 0) return { label: "No Signal", tone: "empty" };
+  if (score >= 82) return { label: "High Confidence", tone: "strong" };
+  if (score >= 62) return { label: "Review", tone: "review" };
+  return { label: "Low Confidence", tone: "weak" };
+}
+
+function buildCandidateRows(bestDetection: PlateDetection | null) {
+  if (!bestDetection) return [];
+
+  const rows = [
+    {
+      plate: bestDetection.text || "Unread",
+      confidence: bestDetection.final_confidence,
+    },
+    ...bestDetection.candidates,
+  ];
+  const seen = new Set<string>();
+
+  return rows
+    .filter((candidate) => {
+      const key = candidate.plate.toUpperCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 10);
+}
+
+function createExportPayload(
+  result: PlateDetectionResponse,
+  file: File | null,
+  processingTimeMs: number | null,
+  qualityScore: number,
+  processedAt: string | null,
+): InvestigationExport {
+  return {
+    exported_at: new Date().toISOString(),
+    processed_at: processedAt,
+    uploaded_file_name: file?.name ?? null,
+    stored_filename: result.filename,
+    original_image_url: resolveAssetUrl(`/uploads/${result.filename}`),
+    annotated_image_url: result.annotated_image_url ? resolveAssetUrl(result.annotated_image_url) : null,
+    detector: result.detector,
+    model_configured: result.model_configured,
+    plates_detected: result.plates_detected,
+    quality_score: qualityScore,
+    processing_time_ms: processingTimeMs,
+    detections: result.detections.map((detection, index) => ({
+      index: index + 1,
+      plate: detection.text,
+      final_confidence: detection.final_confidence,
+      detector_confidence: detection.confidence,
+      ocr_confidence: detection.ocr_confidence,
+      coordinates: detection.coordinates,
+      cropped_plate_url: resolveAssetUrl(detection.cropped_plate_url),
+      candidates: detection.candidates,
+    })),
+  };
+}
+
+function createCsv(payload: InvestigationExport): string {
+  const headers = [
+    "stored_filename",
+    "uploaded_file_name",
+    "detector",
+    "model_configured",
+    "plates_detected",
+    "quality_score",
+    "processing_time_ms",
+    "detection_index",
+    "plate",
+    "final_confidence",
+    "detector_confidence",
+    "ocr_confidence",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "cropped_plate_url",
+    "candidates",
+  ];
+
+  const detections = payload.detections.length > 0 ? payload.detections : [null];
+  const rows = detections.map((detection) => {
+    const base = [
+      payload.stored_filename,
+      payload.uploaded_file_name ?? "",
+      payload.detector,
+      String(payload.model_configured),
+      String(payload.plates_detected),
+      String(payload.quality_score),
+      payload.processing_time_ms?.toString() ?? "",
+    ];
+
+    if (!detection) {
+      return [...base, "", "", "", "", "", "", "", "", "", ""].map(csvEscape).join(",");
+    }
+
+    return [
+      ...base,
+      String(detection.index),
+      detection.plate,
+      String(detection.final_confidence),
+      String(detection.detector_confidence),
+      String(detection.ocr_confidence),
+      String(detection.coordinates.x1),
+      String(detection.coordinates.y1),
+      String(detection.coordinates.x2),
+      String(detection.coordinates.y2),
+      detection.cropped_plate_url,
+      detection.candidates.map((candidate) => `${candidate.plate}:${candidate.confidence}`).join(" | "),
+    ]
+      .map(csvEscape)
+      .join(",");
+  });
+
+  return [headers.join(","), ...rows].join("\n");
+}
+
+function createPdf(payload: InvestigationExport): Blob {
+  const lines = [
+    "LPR Investigation Report",
+    `Exported: ${formatTimestamp(payload.exported_at)}`,
+    `Processed: ${payload.processed_at ? formatTimestamp(payload.processed_at) : "Pending"}`,
+    `Uploaded file: ${payload.uploaded_file_name ?? "Unknown"}`,
+    `Stored file: ${payload.stored_filename}`,
+    `Detector: ${payload.detector}`,
+    `Model configured: ${payload.model_configured ? "yes" : "no"}`,
+    `Plates detected: ${payload.plates_detected}`,
+    `Quality score: ${payload.quality_score}/100`,
+    `Processing time: ${formatDuration(payload.processing_time_ms)}`,
+    `Annotated image: ${payload.annotated_image_url ?? "Not generated"}`,
+    "",
+    "Detections",
+    ...payload.detections.flatMap((detection) => [
+      `#${detection.index} Plate: ${detection.plate || "Unread"}`,
+      `  Final: ${formatPercent(detection.final_confidence)} | OCR: ${formatPercent(
+        detection.ocr_confidence,
+      )} | Detector: ${formatPercent(detection.detector_confidence)}`,
+      `  Box: x1 ${detection.coordinates.x1}, y1 ${detection.coordinates.y1}, x2 ${detection.coordinates.x2}, y2 ${detection.coordinates.y2}`,
+      `  Crop: ${detection.cropped_plate_url}`,
+      `  Candidates: ${
+        detection.candidates.length > 0
+          ? detection.candidates.map((candidate) => `${candidate.plate} ${formatPercent(candidate.confidence)}`).join(", ")
+          : "None"
+      }`,
+      "",
+    ]),
+  ];
+
+  const wrappedLines = lines.flatMap((line) => wrapLine(line, 92)).slice(0, 52);
+  const content = buildPdfContent(wrappedLines);
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(pdf.length);
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += "0000000000 65535 f \n";
+  offsets.slice(1).forEach((offset) => {
+    pdf += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  });
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+  return new Blob([pdf], { type: "application/pdf" });
+}
+
+function buildPdfContent(lines: string): string;
+function buildPdfContent(lines: string[]): string;
+function buildPdfContent(lines: string | string[]): string {
+  const pageLines = Array.isArray(lines) ? lines : [lines];
+  const operations = ["BT", "/F1 16 Tf", `1 0 0 1 50 758 Tm`, `(${escapePdfText(pageLines[0] ?? "")}) Tj`, "/F1 10 Tf"];
+
+  pageLines.slice(1).forEach((line, index) => {
+    operations.push(`1 0 0 1 50 ${734 - index * 14} Tm`, `(${escapePdfText(line)}) Tj`);
+  });
+  operations.push("ET");
+  return operations.join("\n");
+}
+
+function wrapLine(line: string, maxLength: number): string[] {
+  if (line.length <= maxLength) return [line];
+
+  const words = line.split(" ");
+  const wrapped: string[] = [];
+  let current = "";
+
+  words.forEach((word) => {
+    if (`${current} ${word}`.trim().length > maxLength) {
+      if (current) wrapped.push(current);
+      current = word;
+      return;
+    }
+    current = `${current} ${word}`.trim();
+  });
+
+  if (current) wrapped.push(current);
+  return wrapped;
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+function buildFilename(filename: string, extension: "json" | "csv" | "pdf"): string {
+  const base = filename.replace(/\.[^.]+$/, "").replace(/[^a-z0-9_-]+/gi, "_");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${base || "lpr_result"}_${stamp}.${extension}`;
+}
+
+function csvEscape(value: string): string {
+  if (/[",\n]/.test(value)) return `"${value.replace(/"/g, '""')}"`;
+  return value;
+}
+
+function escapePdfText(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(clamp(value, 0, 1) * 100)}%`;
+}
+
+function formatDuration(value: number | null): string {
+  if (value === null) return "Pending";
+  if (value < 1000) return `${value} ms`;
+  return `${(value / 1000).toFixed(2)} s`;
+}
+
+function formatTimestamp(value: string): string {
+  return new Intl.DateTimeFormat("en-IN", {
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(new Date(value));
+}
+
+function formatBox(detection: PlateDetection): string {
+  const { x1, y1, x2, y2 } = detection.coordinates;
+  return `x1 ${x1} / y1 ${y1} / x2 ${x2} / y2 ${y2}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }

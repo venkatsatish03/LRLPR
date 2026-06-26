@@ -104,7 +104,7 @@ self.__SERVER_FILES_MANIFEST={
         "transform": "lodash/{{member}}"
       }
     },
-    "outputFileTracingRoot": "C:\\Users\\venka\\OneDrive\\Desktop\\LPR\\frontend",
+    "outputFileTracingRoot": "C:\\Projects\\LPR\\frontend",
     "cacheComponents": false,
     "cacheLife": {
       "default": {
@@ -304,11 +304,11 @@ self.__SERVER_FILES_MANIFEST={
     "bundlePagesRouterDependencies": false,
     "configFileName": "next.config.ts",
     "turbopack": {
-      "root": "C:\\Users\\venka\\OneDrive\\Desktop\\LPR\\frontend"
+      "root": "C:\\Projects\\LPR\\frontend"
     },
     "distDirRoot": ".next"
   },
-  "appDir": "C:\\Users\\venka\\OneDrive\\Desktop\\LPR\\frontend",
+  "appDir": "C:\\Projects\\LPR\\frontend",
   "relativeAppDir": "",
   "files": [
     ".next\\package.json",

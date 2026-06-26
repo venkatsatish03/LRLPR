@@ -15,6 +15,7 @@ class PlateCandidate(BaseModel):
 
 class PlateDetection(BaseModel):
     confidence: float
+    final_confidence: float
     coordinates: BoundingBox
     cropped_plate_path: str
     cropped_plate_url: str

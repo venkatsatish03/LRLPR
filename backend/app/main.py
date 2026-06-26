@@ -159,16 +159,16 @@ def _select_best_detection(detections):
     best_detection = max(
         detections,
         key=lambda detection: (
+            detection.final_confidence,
             len(detection.text),
             detection.ocr_confidence,
             detection.confidence,
         ),
     )
 
-    final_confidence = (best_detection.confidence * 0.4) + (best_detection.ocr_confidence * 0.6)
     return {
         "text": best_detection.text,
-        "confidence": round(final_confidence, 4),
+        "confidence": best_detection.final_confidence,
         "candidates": best_detection.candidates if best_detection.ocr_confidence < 0.8 else [],
     }
 
@@ -189,6 +189,7 @@ def _summarize_detection(response: PlateDetectionResponse):
     best_detection = max(
         response.detections,
         key=lambda detection: (
+            detection.final_confidence,
             len(detection.text),
             detection.ocr_confidence,
             detection.confidence,
