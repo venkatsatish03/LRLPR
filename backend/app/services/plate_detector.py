@@ -13,6 +13,8 @@ from app.services.ocr_service import OCRService
 
 class PlateDetectorService:
     FALLBACK_NMS_IOU_THRESHOLD = 0.35
+    CORNER_EXCLUSION_RATIO = 0.15
+    MIN_FALLBACK_PLAUSIBILITY_SCORE = 0.40
     MIN_REALISTIC_PLATE_TEXT_LENGTH = 6
     MAX_REALISTIC_PLATE_TEXT_LENGTH = 13
     NON_PLATE_TEXT_MARKERS = {
@@ -158,6 +160,8 @@ class PlateDetectorService:
 
         detections = []
         annotated_image = image.copy()
+        raw_boxes = []
+        image_height, image_width = image.shape[:2]
 
         for index, box in enumerate(result.boxes):
             confidence = float(box.conf[0])
@@ -165,22 +169,36 @@ class PlateDetectorService:
 
             x1 = max(0, x1)
             y1 = max(0, y1)
-            x2 = min(image.shape[1], x2)
-            y2 = min(image.shape[0], y2)
+            x2 = min(image_width, x2)
+            y2 = min(image_height, y2)
 
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            if not self._is_plausible_yolo_box(x1, y1, x2, y2, image.shape[1], image.shape[0]):
+            if not self._is_plausible_yolo_box(x1, y1, x2, y2, image_width, image_height):
                 continue
 
+            raw_boxes.append(
+                {
+                    "index": index,
+                    "confidence": confidence,
+                    "box": (x1, y1, x2, y2),
+                }
+            )
+
+        raw_boxes = self._filter_corner_boxes(raw_boxes, image_width, image_height)
+
+        for raw_box in raw_boxes:
+            index = int(raw_box["index"])
+            confidence = float(raw_box["confidence"])
+            x1, y1, x2, y2 = raw_box["box"]
             crop_box = self._expand_box_with_padding(
                 x1,
                 y1,
                 x2,
                 y2,
-                image.shape[1],
-                image.shape[0],
+                image_width,
+                image_height,
                 settings.YOLO_CROP_PADDING_X,
                 settings.YOLO_CROP_PADDING_Y,
             )
@@ -249,6 +267,13 @@ class PlateDetectorService:
             )
 
         candidates = self._filter_candidates_by_geometry(candidates, image_width, image_height)
+        candidates = self._filter_corner_candidates(candidates, image_width, image_height)
+        candidates = self._filter_candidates_by_plausibility(candidates)
+        if not candidates:
+            lower_center_candidate = self._find_lower_center_plate_candidate(image)
+            if lower_center_candidate is not None:
+                candidates = [lower_center_candidate]
+
         candidates = self._deduplicate_candidates(candidates)
         if settings.FALLBACK_ENABLE_WHOLE_IMAGE_PLATE_CANDIDATE:
             whole_image_candidate = self._whole_image_plate_candidate(image, candidates)
@@ -404,30 +429,22 @@ class PlateDetectorService:
         dark_ratio = cv2.countNonZero(cv2.inRange(gray, 0, 85)) / max(image_width * image_height, 1)
 
         looks_like_single_line_plate = (
-            2.0 <= aspect_ratio <= 6.8
+            settings.YOLO_MIN_ASPECT_RATIO <= aspect_ratio <= settings.YOLO_MAX_ASPECT_RATIO
             and image_height <= 350
             and bright_ratio >= 0.32
             and dark_ratio >= 0.04
         )
         looks_like_two_line_plate_photo = (
-            0.75 <= aspect_ratio <= 1.7
-            and max(image_width, image_height) <= 1200
-            and bright_ratio >= 0.55
+            0.8 <= aspect_ratio <= 2.5
+            and max(image_width, image_height) <= 900
+            and bright_ratio >= 0.68
             and dark_ratio >= 0.08
         )
-        fallback_is_fragmented = bool(candidates) and max(
-            (candidate["box"][2] - candidate["box"][0]) / max(image_width, 1)
-            for candidate in candidates[: min(len(candidates), 3)]
-        ) < 0.45
 
-        if not (looks_like_single_line_plate or looks_like_two_line_plate_photo or fallback_is_fragmented):
+        if not (looks_like_single_line_plate or looks_like_two_line_plate_photo):
             return None
 
-        score = 0.62
-        if looks_like_single_line_plate:
-            score = 0.74
-        elif looks_like_two_line_plate_photo:
-            score = 0.68
+        score = 0.74 if looks_like_single_line_plate else 0.68
 
         return PlateDetectorService._candidate(
             score,
@@ -723,6 +740,126 @@ class PlateDetectorService:
                 filtered.append(candidate)
 
         return filtered
+
+    @classmethod
+    def _filter_corner_boxes(cls, boxes: list[dict], image_width: int, image_height: int) -> list[dict]:
+        non_corner_boxes = [
+            box
+            for box in boxes
+            if not cls._is_corner_zone_candidate(*box["box"], image_width, image_height)
+        ]
+        return non_corner_boxes or boxes
+
+    @classmethod
+    def _filter_corner_candidates(cls, candidates: list[dict], image_width: int, image_height: int) -> list[dict]:
+        non_corner_candidates = [
+            candidate
+            for candidate in candidates
+            if not cls._is_corner_zone_candidate(*candidate["box"], image_width, image_height)
+        ]
+        return non_corner_candidates or candidates
+
+    @staticmethod
+    def _filter_candidates_by_plausibility(candidates: list[dict]) -> list[dict]:
+        return [
+            candidate
+            for candidate in candidates
+            if float(candidate.get("score", 0.0)) >= PlateDetectorService.MIN_FALLBACK_PLAUSIBILITY_SCORE
+        ]
+
+    @classmethod
+    def _is_corner_zone_candidate(
+        cls,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        image_width: int,
+        image_height: int,
+    ) -> bool:
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        margin_x = image_width * cls.CORNER_EXCLUSION_RATIO
+        margin_y = image_height * cls.CORNER_EXCLUSION_RATIO
+
+        in_left = center_x <= margin_x
+        in_right = center_x >= image_width - margin_x
+        in_top = center_y <= margin_y
+        in_bottom = center_y >= image_height - margin_y
+        return (in_left or in_right) and (in_top or in_bottom)
+
+    @staticmethod
+    def _find_lower_center_plate_candidate(image) -> dict | None:
+        image_height, image_width = image.shape[:2]
+        if image_width <= 0 or image_height <= 0:
+            return None
+
+        lower_y = int(image_height * 0.45)
+        lower_image = image[lower_y:image_height]
+        gray = cv2.cvtColor(lower_image, cv2.COLOR_BGR2GRAY)
+        bright_mask = cv2.inRange(gray, 145, 255)
+        bright_mask = cv2.morphologyEx(
+            bright_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (31, 9)),
+            iterations=1,
+        )
+
+        contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best_candidate = None
+        best_score = 0.0
+        image_area = image_width * image_height
+
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[: settings.FALLBACK_MAX_CONTOURS]:
+            x, y, width, height = cv2.boundingRect(contour)
+            if height <= 0:
+                continue
+
+            x1 = x
+            y1 = y + lower_y
+            x2 = x + width
+            y2 = y + height + lower_y
+            center_x_ratio = (x1 + width / 2) / image_width
+            center_y_ratio = (y1 + height / 2) / image_height
+            if center_x_ratio < 0.18 or center_x_ratio > 0.82 or center_y_ratio < 0.48:
+                continue
+
+            if not PlateDetectorService._passes_plate_geometry_gate(
+                x1,
+                y1,
+                x2,
+                y2,
+                image_width,
+                image_height,
+                min_area_ratio=0.00035,
+                max_area_ratio=0.18,
+            ):
+                continue
+
+            roi_gray = gray[y : y + height, x : x + width]
+            bright_ratio = cv2.countNonZero(cv2.inRange(roi_gray, 145, 255)) / max(width * height, 1)
+            dark_ratio = cv2.countNonZero(cv2.inRange(roi_gray, 0, 95)) / max(width * height, 1)
+            if bright_ratio < 0.28 or dark_ratio < 0.025:
+                continue
+
+            aspect_ratio = width / height
+            area_ratio = (width * height) / max(image_area, 1)
+            ratio_score = 1.0 - min(abs(aspect_ratio - 4.0) / 4.0, 1.0)
+            area_score = min(area_ratio / 0.08, 1.0)
+            fill_score = min(bright_ratio / 0.65, 1.0)
+            score = 0.42 + (ratio_score * 0.25) + (area_score * 0.17) + (fill_score * 0.16)
+            if score > best_score:
+                best_score = score
+                best_candidate = PlateDetectorService._candidate(
+                    min(score, 0.74),
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    "lower_center_plate_candidate",
+                )
+
+        return best_candidate
 
     @staticmethod
     def _aspect_ratio_plausibility_score(x1: int, y1: int, x2: int, y2: int) -> float:

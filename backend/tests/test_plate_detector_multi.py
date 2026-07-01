@@ -100,6 +100,48 @@ class PlateDetectorMultiDetectionTest(unittest.TestCase):
 
         self.assertEqual([candidate["source"] for candidate in filtered], ["plate_shape"])
 
+    def test_corner_candidates_are_rejected_when_non_corner_candidate_exists(self) -> None:
+        service = PlateDetectorService(ocr_service=FakeOCRService([]))
+        candidates = [
+            service._candidate(0.88, 548, 430, 628, 455, "bottom_right_watermark"),
+            service._candidate(0.82, 220, 330, 380, 370, "lower_center_plate"),
+        ]
+
+        filtered = service._filter_corner_candidates(candidates, 640, 480)
+
+        self.assertEqual([candidate["source"] for candidate in filtered], ["lower_center_plate"])
+
+    def test_only_corner_candidate_is_kept_for_edge_case_images(self) -> None:
+        service = PlateDetectorService(ocr_service=FakeOCRService([]))
+        candidates = [
+            service._candidate(0.88, 548, 430, 628, 455, "bottom_right_plate"),
+        ]
+
+        filtered = service._filter_corner_candidates(candidates, 640, 480)
+
+        self.assertEqual(filtered, candidates)
+
+    def test_low_plausibility_fallback_candidates_are_filtered_before_ocr(self) -> None:
+        service = PlateDetectorService(ocr_service=FakeOCRService([]))
+        candidates = [
+            service._candidate(0.32, 120, 220, 260, 260, "door_panel"),
+            service._candidate(0.46, 220, 330, 380, 370, "plate_panel"),
+        ]
+
+        filtered = service._filter_candidates_by_plausibility(candidates)
+
+        self.assertEqual([candidate["source"] for candidate in filtered], ["plate_panel"])
+
+    def test_lower_center_rescue_finds_horizontal_plate_like_region(self) -> None:
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        image[330:370, 220:420] = 230
+        image[342:358, 250:390] = 20
+
+        candidate = PlateDetectorService._find_lower_center_plate_candidate(image)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["source"], "lower_center_plate_candidate")
+
     def test_prefers_valid_plate_detection_over_secondary_junk_text(self) -> None:
         detections = [
             {"text": "HR26DQ5551", "final_confidence": 0.79, "ocr_confidence": 0.73, "confidence": 0.87},
@@ -176,6 +218,16 @@ class PlateDetectorMultiDetectionTest(unittest.TestCase):
 
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate["box"], (0, 0, 500, 500))
+
+    def test_whole_image_candidate_rejects_full_vehicle_photo_shape(self) -> None:
+        image = np.zeros((705, 800, 3), dtype=np.uint8)
+        image[:420, :] = 235
+        image[520:565, 280:520] = 245
+        image[532:552, 320:480] = 20
+
+        candidate = PlateDetectorService._whole_image_plate_candidate(image, [])
+
+        self.assertIsNone(candidate)
 
     def test_direct_plate_upload_uses_whole_image_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

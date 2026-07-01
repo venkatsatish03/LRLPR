@@ -11,6 +11,7 @@ from fastapi import HTTPException, status
 from app.core.config import settings
 from app.services.candidate_generator import PlateCandidateGenerator
 from app.services.image_enhancement import ImageEnhancementService, get_image_enhancement_service
+from app.services.indian_plate_validator import IndianPlateValidationEngine
 
 
 _reader_cache: dict[tuple[tuple[str, ...], bool], easyocr.Reader] = {}
@@ -91,6 +92,7 @@ class OCRService:
         self._reader: easyocr.Reader | None = None
         self.enhancement_service = enhancement_service or get_image_enhancement_service()
         self.candidate_generator = PlateCandidateGenerator()
+        self.plate_validator = IndianPlateValidationEngine()
 
     @property
     def reader(self) -> easyocr.Reader:
@@ -292,13 +294,41 @@ class OCRService:
         if height < 24 or width < 60:
             return image
 
-        trim_x = max(1, int(width * 0.02))
+        trim_x = max(1, int(width * 0.04))
         trim_y = max(1, int(height * 0.04))
         if width - (trim_x * 2) < 40 or height - (trim_y * 2) < 16:
             return image
 
         # YOLO crops often include a thin border of bumper/background that pulls OCR away from glyphs.
         return image[trim_y : height - trim_y, trim_x : width - trim_x]
+
+    @staticmethod
+    def _drop_edge_hallucination_if_better(
+        text: str,
+        char_confidences: list[float],
+    ) -> tuple[str, list[float]]:
+        cleaned_text = OCRService._normalize_plate_text(text)
+        if len(cleaned_text) <= 10:
+            return cleaned_text, char_confidences
+
+        edge_confusables = {"I", "1", "0", "O", "L"}
+        options = [(cleaned_text, char_confidences)]
+        if cleaned_text[0] in edge_confusables:
+            options.append((cleaned_text[1:], char_confidences[1:]))
+        if cleaned_text[-1] in edge_confusables:
+            options.append((cleaned_text[:-1], char_confidences[:-1]))
+        if cleaned_text[0] in edge_confusables and cleaned_text[-1] in edge_confusables:
+            options.append((cleaned_text[1:-1], char_confidences[1:-1]))
+
+        valid_options = [
+            option
+            for option in options[1:]
+            if 8 <= len(option[0]) <= 10 and PlateCandidateGenerator.matches_plate_pattern(option[0])
+        ]
+        if not valid_options:
+            return cleaned_text, char_confidences
+
+        return max(valid_options, key=lambda option: len(option[0]))
 
     def _should_stop_early(self, ranked_candidates: list[dict[str, str | float]], variants_processed: int) -> bool:
         if variants_processed < settings.OCR_MIN_VARIANTS_BEFORE_EARLY_EXIT:
@@ -351,6 +381,7 @@ class OCRService:
             joined_text = joined_text[country_prefix_length:]
             char_confidences = char_confidences[country_prefix_length:]
 
+        joined_text, char_confidences = self._drop_edge_hallucination_if_better(joined_text, char_confidences)
         average_confidence = round(sum(confidences) / len(confidences), 4)
         candidates = self._generate_plate_candidates(joined_text, average_confidence, char_confidences)
         plate_text = candidates[0]["plate"] if candidates else ""
@@ -386,15 +417,49 @@ class OCRService:
                     "center_x": center_x,
                     "center_y": center_y,
                     "height": height,
+                    "left_x": float(points[:, 0].min()),
+                    "right_x": float(points[:, 0].max()),
                 }
             )
 
+        tokens = cls._drop_left_edge_plate_markers(tokens)
         rows = cls._group_tokens_into_rows(tokens)
         ordered_tokens = []
         for row in rows:
             ordered_tokens.extend(cls._clean_ordered_row_tokens(sorted(row, key=lambda token: token["center_x"])))
 
         return [(str(token["text"]), float(token["confidence"])) for token in ordered_tokens]
+
+    @staticmethod
+    def _drop_left_edge_plate_markers(tokens: list[dict]) -> list[dict]:
+        if len(tokens) <= 1:
+            return tokens
+
+        crop_right_edge = max(float(token["right_x"]) for token in tokens)
+        marker_limit = max(36.0, crop_right_edge * 0.18)
+        has_plate_like_token_to_right = any(
+            float(token["center_x"]) > marker_limit
+            and (
+                PlateCandidateGenerator.matches_plate_pattern(str(token["text"]))
+                or str(token["text"])[:2] in OCRService.INDIAN_STATE_CODES
+            )
+            for token in tokens
+        )
+        return [
+            token
+            for token in tokens
+            if not (
+                len(str(token["text"])) == 1
+                and str(token["text"]) in {"I", "1", "0", "O"}
+                and float(token["center_x"]) <= marker_limit
+            )
+            and not (
+                has_plate_like_token_to_right
+                and float(token["center_x"]) <= marker_limit
+                and float(token["confidence"]) < 0.45
+                and len(str(token["text"])) <= 3
+            )
+        ]
 
     @staticmethod
     def _is_country_marker(text: str) -> bool:
@@ -705,11 +770,59 @@ class OCRService:
         if not cleaned_text:
             return []
 
-        # Candidates now come from one-character OCR-confusion substitutions, never trailing deletion.
-        return self.candidate_generator.generate(
+        # First pass favors exact OCR plus position-aware Indian-format substitutions.
+        candidates = self.candidate_generator.generate(
             cleaned_text,
             base_confidence,
             char_confidences=char_confidences,
             max_candidates=self.MAX_ALTERNATE_CANDIDATES,
             regex_boost_enabled=True,
         )
+
+        needs_validator_recovery = len(cleaned_text) > 10 or not any(
+            PlateCandidateGenerator.matches_plate_pattern(str(candidate["plate"]))
+            for candidate in candidates
+        )
+        if not needs_validator_recovery:
+            return candidates
+
+        # The validator is only used as a recovery path for contaminated/overlong reads.
+        # That prevents substring corrections from outranking clean, already-valid OCR.
+        validator_candidates = self.plate_validator.generate_candidates(cleaned_text, base_confidence)
+        merged_candidates = {str(candidate["plate"]): float(candidate["confidence"]) for candidate in candidates}
+        validator_valid_candidates = []
+        for candidate in validator_candidates:
+            plate = str(candidate["plate"])
+            confidence = float(candidate["confidence"])
+            if not PlateCandidateGenerator.matches_plate_pattern(plate):
+                continue
+            if len(cleaned_text) > 10:
+                confidence = max(confidence, base_confidence * 0.9)
+            validator_valid_candidates.append({"plate": plate, "confidence": confidence})
+            merged_candidates[plate] = max(merged_candidates.get(plate, 0.0), confidence)
+
+        if len(cleaned_text) > 10 and validator_valid_candidates:
+            return [
+                {"plate": str(candidate["plate"]), "confidence": round(float(candidate["confidence"]), 4)}
+                for candidate in sorted(
+                    validator_valid_candidates,
+                    key=lambda candidate: (
+                        float(candidate["confidence"]) - max(len(str(candidate["plate"])) - 10, 0) * 0.04,
+                        -abs(len(str(candidate["plate"])) - 10),
+                    ),
+                    reverse=True,
+                )[: self.MAX_ALTERNATE_CANDIDATES]
+            ]
+
+        return [
+            {"plate": plate, "confidence": round(confidence, 4)}
+            for plate, confidence in sorted(
+                merged_candidates.items(),
+                key=lambda item: (
+                    item[1],
+                    PlateCandidateGenerator.matches_plate_pattern(item[0]),
+                    len(item[0]),
+                ),
+                reverse=True,
+            )[: self.MAX_ALTERNATE_CANDIDATES]
+        ]

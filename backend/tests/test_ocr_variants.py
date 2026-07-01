@@ -67,6 +67,17 @@ class OCRVariantTest(unittest.TestCase):
 
         self.assertEqual(parsed["text"], "KA19P8488")
 
+    def test_drops_low_confidence_country_block_fragment_before_plate_token(self) -> None:
+        service = OCRService()
+        results = [
+            ([[0, 35], [39, 35], [39, 71], [0, 71]], "NDL", 0.14),
+            ([[20, 6], [438, 6], [438, 102], [20, 102]], "KA19P8488", 0.89),
+        ]
+
+        parsed = service._parse_results(results)
+
+        self.assertEqual(parsed["text"], "KA19P8488")
+
     def test_groups_same_row_tokens_before_sorting_two_line_plate(self) -> None:
         service = OCRService()
         results = [
@@ -78,6 +89,39 @@ class OCRVariantTest(unittest.TestCase):
         parsed = service._parse_results(results)
 
         self.assertEqual(parsed["text"], "TS09PB2381")
+
+    def test_drops_isolated_left_edge_marker_before_two_row_join(self) -> None:
+        service = OCRService()
+        results = [
+            ([[4, 95], [18, 95], [18, 130], [4, 130]], "I", 0.88),
+            ([[84, 30], [250, 30], [250, 86], [84, 86]], "MH14", 0.91),
+            ([[92, 92], [168, 92], [168, 140], [92, 140]], "GN", 0.87),
+            ([[196, 92], [350, 92], [350, 140], [196, 140]], "9239", 0.94),
+        ]
+
+        parsed = service._parse_results(results)
+
+        self.assertEqual(parsed["text"], "MH14GN9239")
+
+    def test_drops_trailing_edge_hallucination_when_plate_becomes_valid(self) -> None:
+        service = OCRService()
+        results = [
+            ([[0, 0], [300, 0], [300, 60], [0, 60]], "MH47BP82651", 0.64),
+        ]
+
+        parsed = service._parse_results(results)
+
+        self.assertEqual(parsed["text"], "MH47BP8265")
+
+    def test_recovers_overlong_edge_contaminated_plate_with_validator(self) -> None:
+        service = OCRService()
+        results = [
+            ([[0, 0], [300, 0], [300, 60], [0, 60]], "0NHL7BP82651", 0.70),
+        ]
+
+        parsed = service._parse_results(results)
+
+        self.assertEqual(parsed["text"], "MH47BP8265")
 
 
 if __name__ == "__main__":

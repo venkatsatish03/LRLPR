@@ -47,7 +47,7 @@ class ImageEnhancementTest(unittest.TestCase):
     def test_sharp_crop_skips_enhancement_and_uses_rgb_easyocr_input(self) -> None:
         image = np.zeros((50, 160, 3), dtype=np.uint8)
         image[:, 40:120] = (255, 255, 255)
-        image[2, 3] = (255, 0, 0)
+        image[2, 6] = (255, 0, 0)
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             enhancement_service = ImageEnhancementService(
