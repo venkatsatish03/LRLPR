@@ -1,9 +1,17 @@
 from pathlib import Path
+import logging
+import sys
+import threading
+import types
 
 import cv2
-import torch
+import numpy as np
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+_default_enhancement_service: "ImageEnhancementService | None" = None
+_default_enhancement_lock = threading.Lock()
 
 
 class ImageEnhancementService:
@@ -21,8 +29,11 @@ class ImageEnhancementService:
         self.tile = tile
         self.half = half
         self._upsampler = None
+        self._resolved_model_path = self._resolve_model_path(model_path)
+        self._upsampler_lock = threading.Lock()
 
         self.enhanced_dir.mkdir(parents=True, exist_ok=True)
+        self._initialize_upsampler()
 
     def enhance(self, image_path: str | Path) -> dict[str, str | bool]:
         image_path = Path(image_path)
@@ -33,14 +44,7 @@ class ImageEnhancementService:
         output_filename = f"{image_path.stem}_enhanced.jpg"
         output_path = self.enhanced_dir / output_filename
 
-        if self.is_realesrgan_configured():
-            enhanced = self._enhance_with_realesrgan(image)
-            method = "real_esrgan"
-            configured = True
-        else:
-            enhanced = self._enhance_with_opencv(image)
-            method = "opencv_fallback"
-            configured = False
+        enhanced, method, configured = self.enhance_plate_crop_with_metadata(image)
 
         cv2.imwrite(str(output_path), enhanced)
 
@@ -51,25 +55,67 @@ class ImageEnhancementService:
             "enhanced_image_url": f"/uploads/enhanced/{output_filename}",
         }
 
-    def is_realesrgan_configured(self) -> bool:
-        return self.model_path.exists()
-
-    def _enhance_with_realesrgan(self, image):
-        upsampler = self._get_upsampler()
-        enhanced, _ = upsampler.enhance(image, outscale=self.scale)
+    def enhance_plate_crop(
+        self,
+        image: np.ndarray,
+        allow_realesrgan: bool = True,
+        allow_opencv_fallback: bool = True,
+    ) -> np.ndarray:
+        enhanced, _, _ = self.enhance_plate_crop_with_metadata(
+            image,
+            allow_realesrgan=allow_realesrgan,
+            allow_opencv_fallback=allow_opencv_fallback,
+        )
         return enhanced
 
-    def _get_upsampler(self):
-        if self._upsampler is not None:
-            return self._upsampler
+    def enhance_plate_crop_with_metadata(
+        self,
+        image: np.ndarray,
+        allow_realesrgan: bool = True,
+        allow_opencv_fallback: bool = True,
+    ) -> tuple[np.ndarray, str, bool]:
+        image = self._ensure_bgr(image)
+        if allow_realesrgan and self._upsampler is not None:
+            try:
+                return self._enhance_with_realesrgan(image), "real_esrgan", True
+            except Exception as exc:
+                logger.warning("Real-ESRGAN plate enhancement failed; using OpenCV fallback. Error: %s", exc)
+
+        if allow_opencv_fallback:
+            return self._enhance_with_opencv_fallback(image), "opencv_fallback", False
+
+        return image, "skipped", self.is_realesrgan_configured()
+
+    def is_realesrgan_configured(self) -> bool:
+        return self._upsampler is not None
+
+    def _enhance_with_realesrgan(self, image):
+        tile = self._tile_for_crop(image)
+        with self._upsampler_lock:
+            previous_tile = getattr(self._upsampler, "tile", self.tile)
+            self._upsampler.tile = tile
+            try:
+                enhanced, _ = self._upsampler.enhance(image, outscale=self.scale)
+            finally:
+                self._upsampler.tile = previous_tile
+        return enhanced
+
+    def _initialize_upsampler(self) -> None:
+        if self._resolved_model_path is None:
+            logger.warning(
+                "Real-ESRGAN weights not found at %s; cropped plates will use OpenCV enhancement fallback.",
+                self.model_path,
+            )
+            return
 
         try:
+            self._patch_torchvision_functional_tensor()
             from basicsr.archs.rrdbnet_arch import RRDBNet
             from realesrgan import RealESRGANer
-        except ImportError as exc:
-            raise RuntimeError(
-                "Real-ESRGAN dependencies are not installed. Run: pip install -r requirements.txt"
-            ) from exc
+            import torch
+        except Exception as exc:
+            logger.warning("Real-ESRGAN dependencies are unavailable; using OpenCV fallback. Error: %s", exc)
+            return
 
         model = RRDBNet(
             num_in_ch=3,
@@ -80,29 +126,104 @@ class ImageEnhancementService:
             scale=self.scale,
         )
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._upsampler = RealESRGANer(
-            scale=self.scale,
-            model_path=str(self.model_path),
-            model=model,
-            tile=self.tile,
-            tile_pad=10,
-            pre_pad=0,
-            half=self.half and device == "cuda",
-            device=device,
-        )
-        return self._upsampler
+        try:
+            self._upsampler = RealESRGANer(
+                scale=self.scale,
+                model_path=str(self._resolved_model_path),
+                model=model,
+                tile=self.tile,
+                tile_pad=10,
+                pre_pad=0,
+                half=False,
+                device=device,
+            )
+        except Exception as exc:
+            logger.warning("Real-ESRGAN failed to initialize; using OpenCV fallback. Error: %s", exc)
+            self._upsampler = None
 
     @staticmethod
-    def _enhance_with_opencv(image):
-        height, width = image.shape[:2]
-        scale = 2 if max(height, width) < 1800 else 1
-        if scale > 1:
-            image = cv2.resize(image, (width * scale, height * scale), interpolation=cv2.INTER_CUBIC)
+    def _patch_torchvision_functional_tensor() -> None:
+        if "torchvision.transforms.functional_tensor" in sys.modules:
+            return
 
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        from torchvision.transforms import functional
+
+        # BasicSR 1.4.2 imports this legacy torchvision module name.
+        compatibility_module = types.ModuleType("torchvision.transforms.functional_tensor")
+        compatibility_module.rgb_to_grayscale = functional.rgb_to_grayscale
+        sys.modules["torchvision.transforms.functional_tensor"] = compatibility_module
+
+    @staticmethod
+    def should_use_super_resolution(image: np.ndarray) -> bool:
+        height, width = image.shape[:2]
+        return width < 120 or height < 40
+
+    def _tile_for_crop(self, image: np.ndarray) -> int:
+        height, width = image.shape[:2]
+        # Tiny crops are faster without Real-ESRGAN tiling; larger crops keep the configured low-VRAM tile.
+        if width < 150 and height < 50:
+            return 0
+
+        return self.tile
+
+    @staticmethod
+    def _enhance_with_opencv_fallback(image):
+        height, width = image.shape[:2]
+
+        # Stage 1: upscale tiny YOLO crops by 4x with high-quality Lanczos interpolation.
+        upscaled = cv2.resize(image, (width * 4, height * 4), interpolation=cv2.INTER_LANCZOS4)
+
+        # Stage 2: remove color noise introduced by upscaling or low-light compression.
+        denoised = cv2.fastNlMeansDenoisingColored(
+            upscaled,
+            None,
+            h=10,
+            hColor=10,
+            templateWindowSize=7,
+            searchWindowSize=21,
+        )
+
+        # Stage 3: unsharp mask to bring plate glyph edges back before OCR.
+        blurred = cv2.GaussianBlur(denoised, (0, 0), 3)
+        sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
+
+        # Stage 4: CLAHE on LAB lightness to improve local text/background contrast.
+        lab = cv2.cvtColor(sharpened, cv2.COLOR_BGR2LAB)
         lightness, channel_a, channel_b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
         lightness = clahe.apply(lightness)
         enhanced = cv2.merge((lightness, channel_a, channel_b))
-        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
-        return cv2.detailEnhance(enhanced, sigma_s=10, sigma_r=0.15)
+        return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+    @staticmethod
+    def _ensure_bgr(image: np.ndarray) -> np.ndarray:
+        if image.ndim == 2:
+            return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if image.shape[2] == 4:
+            return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        return image
+
+    @staticmethod
+    def _resolve_model_path(model_path: Path) -> Path | None:
+        backend_root = Path(__file__).resolve().parents[2]
+        project_root = Path(__file__).resolve().parents[3]
+        candidates = [
+            model_path,
+            backend_root / model_path,
+            project_root / model_path,
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return None
+
+
+def get_image_enhancement_service() -> ImageEnhancementService:
+    global _default_enhancement_service
+    if _default_enhancement_service is None:
+        with _default_enhancement_lock:
+            if _default_enhancement_service is None:
+                _default_enhancement_service = ImageEnhancementService()
+
+    return _default_enhancement_service

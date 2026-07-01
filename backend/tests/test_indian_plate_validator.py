@@ -34,6 +34,11 @@ class IndianPlateValidationEngineTest(unittest.TestCase):
 
         self.assertEqual(result["best_candidate"], "MH47BP8265")
 
+    def test_corrects_c_as_zero_in_digit_position(self) -> None:
+        result = self.engine.correct("APC9CH1116", 0.56)
+
+        self.assertEqual(result["best_candidate"], "AP09CH1116")
+
     def test_supports_bharat_series(self) -> None:
         result = self.engine.correct("218H2345AA", 0.9)
 

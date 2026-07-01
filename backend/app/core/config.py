@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     S3_ACCESS_KEY: str | None = None
     S3_SECRET_KEY: str | None = None
     AI_SERVICE_URL: str | None = None
+    DETECTION_CONF_THRESHOLD: float | None = None
     YOLO_MODEL_PATH: Path = Path("models/license_plate_detector.pt")
     YOLO_CONFIDENCE_THRESHOLD: float = 0.25
     YOLO_NMS_IOU_THRESHOLD: float = 0.45
@@ -34,8 +35,8 @@ class Settings(BaseSettings):
     YOLO_MIN_BOX_HEIGHT: int = 6
     YOLO_MIN_BOX_AREA_RATIO: float = 0.00005
     YOLO_MAX_BOX_AREA_RATIO: float = 0.20
-    YOLO_MIN_ASPECT_RATIO: float = 1.4
-    YOLO_MAX_ASPECT_RATIO: float = 9.5
+    YOLO_MIN_ASPECT_RATIO: float = 1.8
+    YOLO_MAX_ASPECT_RATIO: float = 5.5
     YOLO_CROP_PADDING_X: float = 0.06
     YOLO_CROP_PADDING_Y: float = 0.16
     YOLO_ALLOW_GENERIC_FALLBACK: bool = False
@@ -46,9 +47,9 @@ class Settings(BaseSettings):
     FALLBACK_MAX_DETECTIONS: int = 2
     FALLBACK_ENABLE_UPSCALE: bool = False
     FALLBACK_ENABLE_WHOLE_IMAGE_PLATE_CANDIDATE: bool = True
-    REAL_ESRGAN_MODEL_PATH: Path = Path("models/RealESRGAN_x4plus.pth")
+    REAL_ESRGAN_MODEL_PATH: Path = Path("weights/RealESRGAN_x4plus.pth")
     REAL_ESRGAN_SCALE: int = 4
-    REAL_ESRGAN_TILE: int = 0
+    REAL_ESRGAN_TILE: int = 128
     REAL_ESRGAN_HALF: bool = False
     OCR_LANGUAGES: str = "en"
     OCR_GPU: bool = False
@@ -92,6 +93,9 @@ class Settings(BaseSettings):
 
         if self.MAX_UPLOAD_SIZE_BYTES <= 0:
             errors.append("MAX_UPLOAD_SIZE_BYTES must be greater than 0.")
+
+        if self.DETECTION_CONF_THRESHOLD is not None:
+            self.YOLO_CONFIDENCE_THRESHOLD = self.DETECTION_CONF_THRESHOLD
 
         if self.YOLO_CONFIDENCE_THRESHOLD < 0 or self.YOLO_CONFIDENCE_THRESHOLD > 1:
             errors.append("YOLO_CONFIDENCE_THRESHOLD must be between 0 and 1.")

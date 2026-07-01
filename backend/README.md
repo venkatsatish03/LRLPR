@@ -81,7 +81,8 @@ The detection pipeline now runs OCR on each cropped plate:
 Vehicle Image
   -> YOLO/OpenCV plate detection
   -> Plate crop
-  -> EasyOCR
+  -> Real-ESRGAN/OpenCV crop enhancement
+  -> EasyOCR on enhanced color + adaptive-threshold binary crop
   -> Text + confidence score
 ```
 
@@ -109,17 +110,21 @@ Uploaded Image
 Place Real-ESRGAN weights here:
 
 ```text
-backend/models/RealESRGAN_x4plus.pth
+backend/weights/RealESRGAN_x4plus.pth
 ```
 
-If the weights are missing, the app uses an OpenCV enhancement fallback so the workflow still runs. For actual Real-ESRGAN output, install dependencies and provide the `.pth` weights file.
+If the weights are missing, the app logs a warning and uses an OpenCV enhancement fallback so the workflow still runs. For actual Real-ESRGAN output, install dependencies and download the `.pth` weights file:
+
+```powershell
+python .\scripts\download_weights.py
+```
 
 Configuration:
 
 ```text
-REAL_ESRGAN_MODEL_PATH=models/RealESRGAN_x4plus.pth
+REAL_ESRGAN_MODEL_PATH=weights/RealESRGAN_x4plus.pth
 REAL_ESRGAN_SCALE=4
-REAL_ESRGAN_TILE=0
+REAL_ESRGAN_TILE=128
 REAL_ESRGAN_HALF=false
 ```
 

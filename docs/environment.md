@@ -60,6 +60,7 @@ When `APP_ENV=production`, these integration variables are also required:
 | `S3_SECRET_KEY` | Production | `minioadmin` | Docker Compose, Backend config | S3 or MinIO secret key. Required in production. |
 | `AI_SERVICE_URL` | Production | `http://ai-service:9000` | Backend config, planned AI service | URL for the separate AI service. Required in production. |
 | `YOLO_MODEL_PATH` | Backend | `models/license_plate_detector.pt` | Backend | Path to trained YOLO license plate weights. |
+| `DETECTION_CONF_THRESHOLD` | Backend | `0.25` | Backend | Optional compatibility override for `YOLO_CONFIDENCE_THRESHOLD`; useful for tuning detector recall without renaming existing env files. |
 | `YOLO_CONFIDENCE_THRESHOLD` | Backend | `0.25` | Backend | Minimum YOLO detection confidence. Must be between 0 and 1. |
 | `YOLO_NMS_IOU_THRESHOLD` | Backend | `0.45` | Backend | YOLO non-maximum suppression IoU threshold. Lower values suppress more overlapping boxes. |
 | `YOLO_IMAGE_SIZE` | Backend | `960` | Backend | Inference image size passed to YOLO. Larger values can improve small plates but reduce speed. |
@@ -71,8 +72,8 @@ When `APP_ENV=production`, these integration variables are also required:
 | `YOLO_MIN_BOX_HEIGHT` | Backend | `6` | Backend | Minimum accepted YOLO box height in pixels after inference. |
 | `YOLO_MIN_BOX_AREA_RATIO` | Backend | `0.00005` | Backend | Minimum accepted box area divided by image area. |
 | `YOLO_MAX_BOX_AREA_RATIO` | Backend | `0.20` | Backend | Maximum accepted box area divided by image area. |
-| `YOLO_MIN_ASPECT_RATIO` | Backend | `1.4` | Backend | Minimum accepted box width/height ratio. |
-| `YOLO_MAX_ASPECT_RATIO` | Backend | `9.5` | Backend | Maximum accepted box width/height ratio. |
+| `YOLO_MIN_ASPECT_RATIO` | Backend | `1.8` | Backend | Minimum accepted YOLO box width/height ratio for plate-shaped detections. |
+| `YOLO_MAX_ASPECT_RATIO` | Backend | `5.5` | Backend | Maximum accepted YOLO box width/height ratio for plate-shaped detections. |
 | `YOLO_CROP_PADDING_X` | Backend | `0.06` | Backend | Horizontal padding ratio added to YOLO boxes for OCR crop only. |
 | `YOLO_CROP_PADDING_Y` | Backend | `0.16` | Backend | Vertical padding ratio added to YOLO boxes for OCR crop only. |
 | `YOLO_ALLOW_GENERIC_FALLBACK` | Backend | `false` | Backend | Allows loading generic `yolov8n.pt` for development only. |
@@ -83,10 +84,10 @@ When `APP_ENV=production`, these integration variables are also required:
 | `FALLBACK_MAX_DETECTIONS` | Backend | `2` | Backend | Maximum fallback detections returned after OCR. |
 | `FALLBACK_ENABLE_UPSCALE` | Backend | `false` | Backend | Enables the expensive upscaled fallback search variant. Prefer false for local speed. |
 | `FALLBACK_ENABLE_WHOLE_IMAGE_PLATE_CANDIDATE` | Backend | `true` | Backend | OCRs the whole upload when it looks like a direct plate image or fallback candidates appear fragmented. |
-| `REAL_ESRGAN_MODEL_PATH` | Backend | `models/RealESRGAN_x4plus.pth` | Backend | Path to Real-ESRGAN enhancement weights. |
+| `REAL_ESRGAN_MODEL_PATH` | Backend | `weights/RealESRGAN_x4plus.pth` | Backend | Path to Real-ESRGAN enhancement weights. Missing weights log a warning and use OpenCV fallback. |
 | `REAL_ESRGAN_SCALE` | Backend | `4` | Backend | Real-ESRGAN scale factor. Must be greater than 0. |
-| `REAL_ESRGAN_TILE` | Backend | `0` | Backend | Real-ESRGAN tile size. `0` disables tiling. |
-| `REAL_ESRGAN_HALF` | Backend | `false` | Backend | Enables half precision when CUDA is available. |
+| `REAL_ESRGAN_TILE` | Backend | `128` | Backend | Real-ESRGAN tile size for lower VRAM use. Must be 0 or greater. |
+| `REAL_ESRGAN_HALF` | Backend | `false` | Backend | Enables half precision when CUDA is available. Keep false for CPU and low-VRAM compatibility. |
 | `OCR_LANGUAGES` | Yes | `en` | Backend | Comma-separated EasyOCR languages. |
 | `OCR_GPU` | Backend | `false` | Backend | Enables EasyOCR GPU mode. |
 | `OCR_PREPROCESSING_STRATEGIES` | Backend | `original_resized,clahe,adaptive_threshold` | Backend | Comma-separated OCR variants to run. Set to `all` for maximum recall and slower processing. |

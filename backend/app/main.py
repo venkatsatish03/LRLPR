@@ -6,8 +6,9 @@ from fastapi.staticfiles import StaticFiles
 from app.api.routes.upload import router as upload_router
 from app.core.config import settings
 from app.schemas.detection import OCRComparisonResponse, PlateDetectionResponse, SimpleDetectionResponse
-from app.services.image_enhancement import ImageEnhancementService
+from app.services.image_enhancement import get_image_enhancement_service
 from app.services.image_storage import ImageStorageService
+from app.services.ocr_service import OCRService
 from app.services.plate_detector import PlateDetectorService
 
 app = FastAPI(
@@ -28,8 +29,14 @@ app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads"
 
 app.include_router(upload_router, prefix=settings.API_PREFIX)
 storage_service = ImageStorageService()
-enhancement_service = ImageEnhancementService()
-plate_detector_service = PlateDetectorService()
+enhancement_service = get_image_enhancement_service()
+ocr_service = OCRService(enhancement_service=enhancement_service)
+plate_detector_service = PlateDetectorService(ocr_service=ocr_service)
+
+
+@app.on_event("startup")
+def initialize_ai_services() -> None:
+    ocr_service.initialize_reader()
 
 
 @app.get("/", response_class=HTMLResponse)

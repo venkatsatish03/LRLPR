@@ -78,6 +78,39 @@ class PlateDetectorMultiDetectionTest(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0]["text"], "KA02JR1207")
 
+    def test_rejects_badge_watermark_and_contaminated_banner_text(self) -> None:
+        self.assertFalse(PlateDetectorService._has_realistic_plate_text("ZX"))
+        self.assertFalse(PlateDetectorService._has_realistic_plate_text("GMHNC"))
+        self.assertFalse(
+            PlateDetectorService._has_realistic_plate_text(
+                "360021620186713033080822E30TS09PB2381POLICEMEW8"
+            )
+        )
+        self.assertTrue(PlateDetectorService._has_realistic_plate_text("HR26DQ5551"))
+
+    def test_fallback_geometry_gate_uses_plate_aspect_range(self) -> None:
+        service = PlateDetectorService(ocr_service=FakeOCRService([]))
+        candidates = [
+            service._candidate(0.9, 0, 0, 100, 100, "near_square"),
+            service._candidate(0.8, 10, 10, 130, 40, "plate_shape"),
+            service._candidate(0.7, 0, 0, 200, 20, "banner"),
+        ]
+
+        filtered = service._filter_candidates_by_geometry(candidates, 640, 480)
+
+        self.assertEqual([candidate["source"] for candidate in filtered], ["plate_shape"])
+
+    def test_prefers_valid_plate_detection_over_secondary_junk_text(self) -> None:
+        detections = [
+            {"text": "HR26DQ5551", "final_confidence": 0.79, "ocr_confidence": 0.73, "confidence": 0.87},
+            {"text": "6MCHIZ", "final_confidence": 0.55, "ocr_confidence": 0.25, "confidence": 0.91},
+        ]
+
+        filtered = PlateDetectorService._filter_low_value_detections(detections)
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["text"], "HR26DQ5551")
+
     def test_builds_condition_variants_for_degraded_images(self) -> None:
         service = PlateDetectorService(ocr_service=FakeOCRService([]))
         image = np.full((80, 160, 3), 64, dtype=np.uint8)

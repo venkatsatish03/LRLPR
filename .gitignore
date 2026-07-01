@@ -2,3 +2,12 @@ node_modules/
 frontend/node_modules/
 node_modules/
 frontend/node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+backend/.venv/
+backend/.venv-*/
+backend/weights/
+frontend/.next/
+backend/uploads/
+uploads/

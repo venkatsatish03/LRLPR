@@ -1,5 +1,7 @@
 import re
 from pathlib import Path
+import threading
+import time
 
 import cv2
 import easyocr
@@ -7,11 +9,19 @@ import numpy as np
 from fastapi import HTTPException, status
 
 from app.core.config import settings
-from app.services.indian_plate_validator import IndianPlateValidationEngine
+from app.services.candidate_generator import PlateCandidateGenerator
+from app.services.image_enhancement import ImageEnhancementService, get_image_enhancement_service
+
+
+_reader_cache: dict[tuple[tuple[str, ...], bool], easyocr.Reader] = {}
+_reader_lock = threading.Lock()
 
 
 class OCRService:
     LOW_CONFIDENCE_THRESHOLD = 0.8
+    SHARP_VARIANCE_THRESHOLD = 200.0
+    MILD_BLUR_VARIANCE_THRESHOLD = 80.0
+    GRAYSCALE_RETRY_CONFIDENCE = 0.5
     MAX_VARIANT_CANDIDATES = 8
     MAX_ALTERNATE_CANDIDATES = 5
     ALL_VARIANT_NAMES = [
@@ -29,28 +39,82 @@ class OCRService:
         "otsu_threshold",
         "closed_threshold",
     ]
+    INDIAN_STATE_CODES = {
+        "AN",
+        "AP",
+        "AR",
+        "AS",
+        "BR",
+        "CG",
+        "CH",
+        "DD",
+        "DL",
+        "DN",
+        "GA",
+        "GJ",
+        "HP",
+        "HR",
+        "JH",
+        "JK",
+        "KA",
+        "KL",
+        "LA",
+        "LD",
+        "MH",
+        "ML",
+        "MN",
+        "MP",
+        "MZ",
+        "NL",
+        "OD",
+        "OR",
+        "PB",
+        "PY",
+        "RJ",
+        "SK",
+        "TN",
+        "TR",
+        "TS",
+        "UK",
+        "UP",
+        "WB",
+    }
 
     def __init__(
         self,
         languages: str = settings.OCR_LANGUAGES,
         gpu: bool = settings.OCR_GPU,
+        enhancement_service: ImageEnhancementService | None = None,
     ) -> None:
         self.languages = [language.strip() for language in languages.split(",") if language.strip()]
-        self.gpu = gpu
+        self.gpu = bool(gpu)
         self._reader: easyocr.Reader | None = None
-        self.plate_engine = IndianPlateValidationEngine()
+        self.enhancement_service = enhancement_service or get_image_enhancement_service()
+        self.candidate_generator = PlateCandidateGenerator()
 
     @property
     def reader(self) -> easyocr.Reader:
         if self._reader is None:
-            try:
-                self._reader = easyocr.Reader(self.languages, gpu=self.gpu)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"EasyOCR failed to initialize: {exc}",
-                ) from exc
+            self.initialize_reader()
         return self._reader
+
+    def initialize_reader(self) -> None:
+        cache_key = (tuple(self.languages), self.gpu)
+        if cache_key in _reader_cache:
+            self._reader = _reader_cache[cache_key]
+            return
+
+        with _reader_lock:
+            if cache_key not in _reader_cache:
+                try:
+                    _reader_cache[cache_key] = easyocr.Reader(self.languages, gpu=self.gpu)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=f"EasyOCR failed to initialize: {exc}",
+                    ) from exc
+
+            self._reader = _reader_cache[cache_key]
 
     def extract_text(self, image_path: str | Path) -> dict:
         image_path = Path(image_path)
@@ -66,35 +130,175 @@ class OCRService:
 
         return self.extract_text_from_image(image)
 
-    def extract_text_from_image(self, image: np.ndarray) -> dict:
-        candidate_votes = []
-        variants_processed = 0
+    def extract_text_from_image(self, image: np.ndarray, include_debug: bool = False) -> dict:
+        analysis = self.analyze_plate_crop(image)
+        response = {
+            "text": analysis["text"],
+            "ocr_confidence": analysis["ocr_confidence"],
+            "candidates": analysis["candidates"],
+        }
+        if include_debug:
+            response["debug"] = analysis
 
-        for variant_name, variant in self._iter_selected_ocr_variants(image):
-            results = self.reader.readtext(
-                variant,
-                allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                detail=1,
-                paragraph=False,
+        return response
+
+    def analyze_plate_crop(self, image: np.ndarray) -> dict:
+        started_at = time.perf_counter()
+        crop_bgr = self._trim_crop_edges(self._ensure_bgr(image))
+        quality_score = self.compute_quality_score(crop_bgr)
+        prepared_bgr, enhancement_path = self._prepare_crop_for_ocr(crop_bgr, quality_score)
+
+        # Stage 1: EasyOCR reads color RGB first; clear plates should not be thresholded.
+        color_result = self._read_plate_variant(prepared_bgr, "color", input_is_bgr=True)
+        attempts = [color_result]
+        best_result = color_result
+
+        # Stage 2: only retry on grayscale if the color read is weak; this avoids doubling OCR cost.
+        if float(color_result["ocr_confidence"]) < self.GRAYSCALE_RETRY_CONFIDENCE:
+            gray_image = cv2.cvtColor(prepared_bgr, cv2.COLOR_BGR2GRAY)
+            gray_result = self._read_plate_variant(gray_image, "grayscale", input_is_bgr=False)
+            attempts.append(gray_result)
+            best_result = self._best_ocr_result(attempts)
+
+        return {
+            "text": best_result["text"],
+            "ocr_confidence": best_result["ocr_confidence"],
+            "candidates": best_result["candidates"],
+            "quality_score": round(float(quality_score), 2),
+            "enhancement_path": enhancement_path,
+            "raw_ocr": [attempt["raw_ocr"] for attempt in attempts],
+            "variant": best_result["variant"],
+            "processing_time_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        }
+
+    def _prepare_crop_for_ocr(self, crop_bgr: np.ndarray, quality_score: float) -> tuple[np.ndarray, str]:
+        height, width = crop_bgr.shape[:2]
+
+        if quality_score > self.SHARP_VARIANCE_THRESHOLD:
+            # Sharp crops preserve the original color signal; preprocessing can damage readable glyphs.
+            return crop_bgr, "skipped_sharp_color"
+
+        if quality_score >= self.MILD_BLUR_VARIANCE_THRESHOLD:
+            # Mild blur gets local contrast and edge boost, but no destructive binarization.
+            return self._apply_mild_preprocessing(crop_bgr), "mild_clahe_sharpen"
+
+        if self.enhancement_service.should_use_super_resolution(crop_bgr):
+            # Heavy blur on tiny crops is the only path that pays the Real-ESRGAN cost.
+            enhanced, method, _ = self.enhancement_service.enhance_plate_crop_with_metadata(
+                crop_bgr,
+                allow_realesrgan=True,
+                allow_opencv_fallback=True,
             )
-            variants_processed += 1
-            parsed_result = self._parse_results(results)
-            for rank, candidate in enumerate(parsed_result["candidates"][: self.MAX_VARIANT_CANDIDATES]):
-                candidate_votes.append(
-                    {
-                        "plate": str(candidate["plate"]),
-                        "confidence": float(candidate["confidence"]),
-                        "variant": variant_name,
-                        "rank": rank,
-                    }
-                )
+            return enhanced, method
 
-            ranked_candidates = self._vote_candidates(candidate_votes)
-            if self._should_stop_early(ranked_candidates, variants_processed):
-                return self._format_response(ranked_candidates)
+        # Large but blurry crops skip super-resolution and use cheap local enhancement.
+        return self._apply_mild_preprocessing(crop_bgr), f"large_low_quality_preprocess_{width}x{height}"
 
-        ranked_candidates = self._vote_candidates(candidate_votes)
-        return self._format_response(ranked_candidates)
+    def _read_plate_variant(self, image: np.ndarray, variant: str, input_is_bgr: bool) -> dict:
+        easyocr_image = self._to_easyocr_image(image, input_is_bgr=input_is_bgr)
+        results = self.reader.readtext(
+            easyocr_image,
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            detail=1,
+            paragraph=False,
+            min_size=10,
+            contrast_ths=0.1,
+            adjust_contrast=0.5,
+            text_threshold=0.6,
+            low_text=0.3,
+        )
+        parsed = self._parse_results(results)
+        parsed["variant"] = variant
+        parsed["raw_ocr"] = {
+            "variant": variant,
+            "items": self._format_raw_ocr(results),
+        }
+        return parsed
+
+    @staticmethod
+    def _best_ocr_result(results: list[dict]) -> dict:
+        return max(
+            results,
+            key=lambda result: (
+                float(result["ocr_confidence"]),
+                len(str(result["text"])),
+            ),
+        )
+
+    @staticmethod
+    def compute_quality_score(image: np.ndarray) -> float:
+        bgr = OCRService._ensure_bgr(image)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    @staticmethod
+    def _apply_mild_preprocessing(image: np.ndarray) -> np.ndarray:
+        # CLAHE on LAB lightness improves weak plate/text contrast without discarding color detail.
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        lightness, channel_a, channel_b = cv2.split(lab)
+        lightness = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(lightness)
+        contrast_bgr = cv2.cvtColor(cv2.merge((lightness, channel_a, channel_b)), cv2.COLOR_LAB2BGR)
+
+        # A light unsharp mask restores glyph edges for mildly blurred crops.
+        blurred = cv2.GaussianBlur(contrast_bgr, (0, 0), 1.2)
+        return cv2.addWeighted(contrast_bgr, 1.35, blurred, -0.35, 0)
+
+    @staticmethod
+    def _to_easyocr_image(image: np.ndarray, input_is_bgr: bool) -> np.ndarray:
+        if image.ndim == 2:
+            return image
+
+        if input_is_bgr:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        return image
+
+    @staticmethod
+    def _format_raw_ocr(results) -> list[dict]:
+        raw_results = []
+        for box, text, confidence in results:
+            raw_results.append(
+                {
+                    "box": [[round(float(x), 2), round(float(y), 2)] for x, y in box],
+                    "text": str(text),
+                    "confidence": round(float(confidence), 4),
+                }
+            )
+
+        return raw_results
+
+    @staticmethod
+    def _build_binary_ocr_image(image: np.ndarray) -> np.ndarray:
+        # Stage 1: convert enhanced color crop to grayscale for thresholding.
+        gray = cv2.cvtColor(OCRService._ensure_bgr(image), cv2.COLOR_BGR2GRAY)
+
+        # Stage 2: adaptive threshold separates dark glyphs from uneven plate backgrounds.
+        binary = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            2,
+        )
+
+        # Stage 3: opening removes isolated threshold noise before EasyOCR.
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    @staticmethod
+    def _trim_crop_edges(image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        if height < 24 or width < 60:
+            return image
+
+        trim_x = max(1, int(width * 0.02))
+        trim_y = max(1, int(height * 0.04))
+        if width - (trim_x * 2) < 40 or height - (trim_y * 2) < 16:
+            return image
+
+        # YOLO crops often include a thin border of bumper/background that pulls OCR away from glyphs.
+        return image[trim_y : height - trim_y, trim_x : width - trim_x]
 
     def _should_stop_early(self, ranked_candidates: list[dict[str, str | float]], variants_processed: int) -> bool:
         if variants_processed < settings.OCR_MIN_VARIANTS_BEFORE_EARLY_EXIT:
@@ -125,11 +329,14 @@ class OCRService:
     def _parse_results(self, results) -> dict:
         text_parts = []
         confidences = []
+        char_confidences = []
         for text, confidence in self._ordered_plate_tokens(results):
             cleaned_text = self._normalize_plate_text(text)
             if cleaned_text:
                 text_parts.append(cleaned_text)
-                confidences.append(float(confidence))
+                token_confidence = float(confidence)
+                confidences.append(token_confidence)
+                char_confidences.extend([token_confidence] * len(cleaned_text))
 
         if not text_parts:
             return {
@@ -139,8 +346,13 @@ class OCRService:
             }
 
         joined_text = "".join(text_parts)
+        country_prefix_length = self._embedded_country_prefix_length(joined_text)
+        if country_prefix_length:
+            joined_text = joined_text[country_prefix_length:]
+            char_confidences = char_confidences[country_prefix_length:]
+
         average_confidence = round(sum(confidences) / len(confidences), 4)
-        candidates = self._generate_plate_candidates(joined_text, average_confidence)
+        candidates = self._generate_plate_candidates(joined_text, average_confidence, char_confidences)
         plate_text = candidates[0]["plate"] if candidates else ""
         if not plate_text:
             return {
@@ -166,21 +378,75 @@ class OCRService:
             points = np.array(box, dtype=np.float32)
             center_x = float(points[:, 0].mean())
             center_y = float(points[:, 1].mean())
+            height = float(points[:, 1].max() - points[:, 1].min())
             tokens.append(
                 {
                     "text": cleaned_text,
                     "confidence": float(confidence),
                     "center_x": center_x,
                     "center_y": center_y,
+                    "height": height,
                 }
             )
 
-        tokens.sort(key=lambda token: (token["center_y"], token["center_x"]))
-        return [(str(token["text"]), float(token["confidence"])) for token in tokens]
+        rows = cls._group_tokens_into_rows(tokens)
+        ordered_tokens = []
+        for row in rows:
+            ordered_tokens.extend(cls._clean_ordered_row_tokens(sorted(row, key=lambda token: token["center_x"])))
+
+        return [(str(token["text"]), float(token["confidence"])) for token in ordered_tokens]
 
     @staticmethod
     def _is_country_marker(text: str) -> bool:
         return text in {"IND", "IIND", "IN", "ND"}
+
+    @staticmethod
+    def _group_tokens_into_rows(tokens: list[dict]) -> list[list[dict]]:
+        rows: list[list[dict]] = []
+        for token in sorted(tokens, key=lambda item: item["center_y"]):
+            if rows:
+                row_center = sum(float(item["center_y"]) for item in rows[-1]) / len(rows[-1])
+                row_height = max(float(item["height"]) for item in rows[-1])
+                tolerance = max(12.0, max(row_height, float(token["height"])) * 0.45)
+                if abs(float(token["center_y"]) - row_center) <= tolerance:
+                    rows[-1].append(token)
+                    continue
+
+            rows.append([token])
+
+        return rows
+
+    @staticmethod
+    def _clean_ordered_row_tokens(tokens: list[dict]) -> list[dict]:
+        for index, token in enumerate(tokens[:-1]):
+            text = str(token["text"])
+            next_text = str(tokens[index + 1]["text"])
+            if (
+                len(text) >= 2
+                and text[-1] in {"I", "1"}
+                and text[:-1].isalpha()
+                and next_text.isdigit()
+                and len(next_text) >= 3
+            ):
+                token = dict(token)
+                token["text"] = text[:-1]
+                tokens[index] = token
+
+        return tokens
+
+    @classmethod
+    def _embedded_country_prefix_length(cls, text: str) -> int:
+        cleaned_text = cls._normalize_plate_text(text)
+        if len(cleaned_text) < 8:
+            return 0
+
+        if cleaned_text.startswith("IND") and cleaned_text[3:5] in cls.INDIAN_STATE_CODES:
+            return 3
+
+        if cleaned_text[0] in {"I", "1"} and cleaned_text[1:3] in cls.INDIAN_STATE_CODES:
+            return 1
+
+        return 0
 
     @classmethod
     def _build_ocr_variants(cls, image: np.ndarray) -> list[tuple[str, np.ndarray]]:
@@ -429,13 +695,21 @@ class OCRService:
     def _normalize_plate_text(text: str) -> str:
         return re.sub(r"[^A-Z0-9]", "", text.upper())
 
-    def _generate_plate_candidates(self, text: str, base_confidence: float) -> list[dict[str, str | float]]:
-        result = self.plate_engine.correct(text, base_confidence)
-        best_candidate = str(result["best_candidate"])
-        if not best_candidate:
+    def _generate_plate_candidates(
+        self,
+        text: str,
+        base_confidence: float,
+        char_confidences: list[float] | None = None,
+    ) -> list[dict[str, str | float]]:
+        cleaned_text = self._normalize_plate_text(text)
+        if not cleaned_text:
             return []
 
-        return [
-            {"plate": best_candidate, "confidence": float(result["confidence"])},
-            *result["alternatives"],
-        ]
+        # Candidates now come from one-character OCR-confusion substitutions, never trailing deletion.
+        return self.candidate_generator.generate(
+            cleaned_text,
+            base_confidence,
+            char_confidences=char_confidences,
+            max_candidates=self.MAX_ALTERNATE_CANDIDATES,
+            regex_boost_enabled=True,
+        )

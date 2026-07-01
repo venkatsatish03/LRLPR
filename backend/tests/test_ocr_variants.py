@@ -47,6 +47,38 @@ class OCRVariantTest(unittest.TestCase):
         self.assertEqual(parsed["text"], "KA02JR1207")
         self.assertGreater(parsed["ocr_confidence"], 0.8)
 
+    def test_strips_country_marker_when_easyocr_merges_it_into_plate_token(self) -> None:
+        service = OCRService()
+        results = [
+            ([[0, 0], [300, 0], [300, 60], [0, 60]], "IHR26D05551", 0.53),
+        ]
+
+        parsed = service._parse_results(results)
+
+        self.assertEqual(parsed["text"], "HR26DQ5551")
+
+    def test_strips_merged_ind_prefix_from_direct_plate_read(self) -> None:
+        service = OCRService()
+        results = [
+            ([[0, 0], [300, 0], [300, 60], [0, 60]], "IKA19P8488", 0.72),
+        ]
+
+        parsed = service._parse_results(results)
+
+        self.assertEqual(parsed["text"], "KA19P8488")
+
+    def test_groups_same_row_tokens_before_sorting_two_line_plate(self) -> None:
+        service = OCRService()
+        results = [
+            ([[124, 12], [436, 12], [436, 137], [124, 137]], "TS09", 0.98),
+            ([[52, 124], [200, 124], [200, 246], [52, 246]], "PBI", 0.39),
+            ([[251, 123], [511, 123], [511, 245], [251, 245]], "2381", 0.99),
+        ]
+
+        parsed = service._parse_results(results)
+
+        self.assertEqual(parsed["text"], "TS09PB2381")
+
 
 if __name__ == "__main__":
     unittest.main()
