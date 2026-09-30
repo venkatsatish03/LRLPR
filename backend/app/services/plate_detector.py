@@ -113,6 +113,47 @@ class PlateDetectorService:
 
         return self._detect_with_yolo(image_path, image)
 
+    def detect_manual_crop(self, image_path: str | Path, coordinates: tuple[float, float, float, float]) -> dict:
+        image_path = Path(image_path)
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unable to read uploaded image.",
+            )
+
+        x1, y1, x2, y2 = self._clamp_manual_crop(coordinates, image.shape[1], image.shape[0])
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selected plate region is empty.",
+            )
+
+        detection = self._build_detection(
+            image_path=image_path,
+            crop=crop,
+            index=0,
+            confidence=1.0,
+            coordinates=(x1, y1, x2, y2),
+            aggressive_ocr=True,
+        )
+        annotated_image = image.copy()
+        self._annotate_detections(annotated_image, [detection], color=(0, 220, 120), label="manual")
+
+        annotated_filename = f"{image_path.stem}_manual_annotated.jpg"
+        annotated_path = self.annotated_dir / annotated_filename
+        cv2.imwrite(str(annotated_path), annotated_image)
+
+        return {
+            "detector": "manual_crop",
+            "model_configured": self._resolve_model_path() is not None,
+            "annotated_image_path": str(annotated_path),
+            "annotated_image_url": f"/uploads/annotated/{annotated_filename}",
+            "plates_detected": 1,
+            "detections": [detection],
+        }
+
     def _detect_direct_plate_upload(self, image_path: Path, image) -> dict | None:
         candidate = self._whole_image_plate_candidate(image, [])
         if candidate is None:
@@ -596,11 +637,12 @@ class PlateDetectorService:
         index: int,
         confidence: float,
         coordinates: tuple[int, int, int, int],
+        aggressive_ocr: bool = False,
     ) -> dict:
         crop_filename = f"{image_path.stem}_plate_{index + 1}_{uuid4().hex[:8]}.jpg"
         crop_path = self.crop_dir / crop_filename
         cv2.imwrite(str(crop_path), crop)
-        ocr_result = self.ocr_service.extract_text_from_image(crop)
+        ocr_result = self.ocr_service.extract_text_from_image(crop, aggressive_enhancement=aggressive_ocr)
         ocr_confidence = float(ocr_result["ocr_confidence"])
         final_confidence = self._combined_confidence(confidence, ocr_confidence, str(ocr_result["text"]))
         x1, y1, x2, y2 = coordinates
@@ -620,6 +662,31 @@ class PlateDetectorService:
             "ocr_confidence": round(ocr_confidence, 4),
             "candidates": ocr_result["candidates"],
         }
+
+    @staticmethod
+    def _clamp_manual_crop(
+        coordinates: tuple[float, float, float, float],
+        image_width: int,
+        image_height: int,
+    ) -> tuple[int, int, int, int]:
+        raw_x1, raw_y1, raw_x2, raw_y2 = coordinates
+        x1 = int(round(min(raw_x1, raw_x2)))
+        y1 = int(round(min(raw_y1, raw_y2)))
+        x2 = int(round(max(raw_x1, raw_x2)))
+        y2 = int(round(max(raw_y1, raw_y2)))
+
+        x1 = max(0, min(x1, image_width))
+        y1 = max(0, min(y1, image_height))
+        x2 = max(0, min(x2, image_width))
+        y2 = max(0, min(y2, image_height))
+
+        if x2 - x1 < 8 or y2 - y1 < 4:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selected plate region is too small.",
+            )
+
+        return x1, y1, x2, y2
 
     def _resolve_yolo_classes(self) -> list[int] | None:
         configured_classes = self._parse_class_ids(settings.YOLO_CLASSES)

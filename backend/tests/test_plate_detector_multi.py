@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from app.core.config import settings
@@ -11,8 +12,10 @@ from app.services.plate_detector import PlateDetectorService
 class FakeOCRService:
     def __init__(self, responses):
         self.responses = list(responses)
+        self.calls = []
 
-    def extract_text_from_image(self, crop):
+    def extract_text_from_image(self, crop, **kwargs):
+        self.calls.append({"shape": crop.shape, **kwargs})
         return self.responses.pop(0)
 
 
@@ -249,6 +252,30 @@ class PlateDetectorMultiDetectionTest(unittest.TestCase):
             self.assertEqual(result["detector"], "direct_plate_image")
             self.assertEqual(result["plates_detected"], 1)
             self.assertEqual(result["detections"][0]["coordinates"], {"x1": 0, "y1": 0, "x2": 480, "y2": 120})
+
+    def test_manual_crop_uses_selected_region_with_aggressive_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            fake_ocr = FakeOCRService(
+                [{"text": "HR26DQ5551", "ocr_confidence": 0.88, "candidates": []}]
+            )
+            service = PlateDetectorService(
+                annotated_dir=tmp_path / "annotated",
+                crop_dir=tmp_path / "plates",
+                ocr_service=fake_ocr,
+            )
+            image = np.zeros((120, 240, 3), dtype=np.uint8)
+            image[50:80, 70:190] = 230
+            image_path = tmp_path / "manual.jpg"
+            cv2.imwrite(str(image_path), image)
+
+            result = service.detect_manual_crop(image_path, (70, 50, 190, 80))
+
+            self.assertEqual(result["detector"], "manual_crop")
+            self.assertEqual(result["plates_detected"], 1)
+            self.assertEqual(result["detections"][0]["text"], "HR26DQ5551")
+            self.assertEqual(result["detections"][0]["coordinates"], {"x1": 70, "y1": 50, "x2": 190, "y2": 80})
+            self.assertTrue(fake_ocr.calls[0]["aggressive_enhancement"])
 
     def test_parses_yolo_class_filter_ids(self) -> None:
         self.assertEqual(PlateDetectorService._parse_class_ids("0, 2, bad, 5"), [0, 2, 5])

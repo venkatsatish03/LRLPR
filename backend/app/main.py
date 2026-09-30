@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, Response, UploadFile, status
+from fastapi import FastAPI, File, Form, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -121,6 +121,27 @@ async def detect_license_plate(file: UploadFile = File(...)) -> SimpleDetectionR
 async def detect_license_plate_details(file: UploadFile = File(...)) -> PlateDetectionResponse:
     saved_image = await storage_service.save_upload(file)
     detection_result = plate_detector_service.detect(saved_image["image_path"])
+
+    return PlateDetectionResponse(
+        filename=saved_image["filename"],
+        path=saved_image["image_path"],
+        **detection_result,
+    )
+
+
+@app.post("/detect/manual-crop", response_model=PlateDetectionResponse)
+async def detect_manual_plate_crop(
+    file: UploadFile = File(...),
+    x1: float = Form(...),
+    y1: float = Form(...),
+    x2: float = Form(...),
+    y2: float = Form(...),
+) -> PlateDetectionResponse:
+    saved_image = await storage_service.save_upload(file)
+    detection_result = plate_detector_service.detect_manual_crop(
+        saved_image["image_path"],
+        (x1, y1, x2, y2),
+    )
 
     return PlateDetectionResponse(
         filename=saved_image["filename"],

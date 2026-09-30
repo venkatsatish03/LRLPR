@@ -25,6 +25,12 @@ class OCRService:
     GRAYSCALE_RETRY_CONFIDENCE = 0.5
     MAX_VARIANT_CANDIDATES = 8
     MAX_ALTERNATE_CANDIDATES = 5
+    MANUAL_RESTORE_MAX_SIDE = 700
+    MANUAL_RESTORE_TARGET_HEIGHT = 72
+    MANUAL_RESTORE_MAX_WIDTH = 1600
+    MANUAL_DIRECT_ACCEPT_CONFIDENCE = 0.55
+    MANUAL_RESTORE_REPLACE_MARGIN = 0.12
+    MIN_STANDARD_PLATE_LENGTH = 7
     ALL_VARIANT_NAMES = [
         "original_resized",
         "grayscale",
@@ -132,8 +138,13 @@ class OCRService:
 
         return self.extract_text_from_image(image)
 
-    def extract_text_from_image(self, image: np.ndarray, include_debug: bool = False) -> dict:
-        analysis = self.analyze_plate_crop(image)
+    def extract_text_from_image(
+        self,
+        image: np.ndarray,
+        include_debug: bool = False,
+        aggressive_enhancement: bool = False,
+    ) -> dict:
+        analysis = self.analyze_plate_crop(image, aggressive_enhancement=aggressive_enhancement)
         response = {
             "text": analysis["text"],
             "ocr_confidence": analysis["ocr_confidence"],
@@ -144,23 +155,46 @@ class OCRService:
 
         return response
 
-    def analyze_plate_crop(self, image: np.ndarray) -> dict:
+    def analyze_plate_crop(self, image: np.ndarray, aggressive_enhancement: bool = False) -> dict:
         started_at = time.perf_counter()
-        crop_bgr = self._trim_crop_edges(self._ensure_bgr(image))
+        source_bgr = self._ensure_bgr(image)
+        crop_bgr = self._normalize_manual_plate_region(source_bgr) if aggressive_enhancement else self._trim_crop_edges(source_bgr)
         quality_score = self.compute_quality_score(crop_bgr)
-        prepared_bgr, enhancement_path = self._prepare_crop_for_ocr(crop_bgr, quality_score)
+        if aggressive_enhancement:
+            # Manual crops should be read in their cleanest original form first; restoration is a fallback.
+            prepared_bgr, enhancement_path = crop_bgr, "manual_direct_color"
+        else:
+            prepared_bgr, enhancement_path = self._prepare_crop_for_ocr(crop_bgr, quality_score)
 
         # Stage 1: EasyOCR reads color RGB first; clear plates should not be thresholded.
-        color_result = self._read_plate_variant(prepared_bgr, "color", input_is_bgr=True)
+        color_result = self._read_plate_variant(
+            prepared_bgr,
+            "color",
+            input_is_bgr=True,
+            high_accuracy=aggressive_enhancement,
+        )
         attempts = [color_result]
         best_result = color_result
 
         # Stage 2: only retry on grayscale if the color read is weak; this avoids doubling OCR cost.
         if float(color_result["ocr_confidence"]) < self.GRAYSCALE_RETRY_CONFIDENCE:
             gray_image = cv2.cvtColor(prepared_bgr, cv2.COLOR_BGR2GRAY)
-            gray_result = self._read_plate_variant(gray_image, "grayscale", input_is_bgr=False)
+            gray_result = self._read_plate_variant(
+                gray_image,
+                "grayscale",
+                input_is_bgr=False,
+                high_accuracy=aggressive_enhancement,
+            )
             attempts.append(gray_result)
             best_result = self._best_ocr_result(attempts)
+
+        if aggressive_enhancement and self._needs_manual_restoration(best_result):
+            manual_attempts, manual_path = self._manual_enhanced_ocr_attempts(crop_bgr)
+            if manual_attempts:
+                attempts.extend(manual_attempts)
+                restored_result = self._best_voted_ocr_result(manual_attempts)
+                best_result = self._choose_manual_result(best_result, restored_result)
+                enhancement_path = f"{enhancement_path}+manual_{manual_path}"
 
         return {
             "text": best_result["text"],
@@ -172,6 +206,160 @@ class OCRService:
             "variant": best_result["variant"],
             "processing_time_ms": round((time.perf_counter() - started_at) * 1000, 2),
         }
+
+    def _manual_enhanced_ocr_attempts(self, crop_bgr: np.ndarray) -> tuple[list[dict], str]:
+        variants = self._manual_restoration_variants(crop_bgr)
+        if not variants:
+            return [], "skipped_size"
+
+        attempts = [
+            self._read_plate_variant(
+                variant_image,
+                variant_name,
+                input_is_bgr=input_is_bgr,
+                high_accuracy=True,
+            )
+            for variant_name, variant_image, input_is_bgr in variants
+        ]
+        return attempts, f"{len(attempts)}_restoration_variants"
+
+    @classmethod
+    def _needs_manual_restoration(cls, result: dict) -> bool:
+        text = str(result.get("text", ""))
+        confidence = float(result.get("ocr_confidence", 0.0))
+        if not text:
+            return True
+
+        is_valid_plate = PlateCandidateGenerator.matches_plate_pattern(text)
+        if is_valid_plate and confidence >= cls.MANUAL_DIRECT_ACCEPT_CONFIDENCE:
+            return False
+
+        return confidence < cls.LOW_CONFIDENCE_THRESHOLD or not is_valid_plate or len(text) < 8
+
+    def _manual_restoration_variants(self, crop_bgr: np.ndarray) -> list[tuple[str, np.ndarray, bool]]:
+        crop_bgr = self._ensure_bgr(crop_bgr)
+        height, width = crop_bgr.shape[:2]
+        if width <= 0 or height <= 0:
+            return []
+
+        variants: list[tuple[str, np.ndarray, bool]] = []
+        scale = self._manual_upscale_factor(width, height)
+
+        if self.enhancement_service.should_use_super_resolution(crop_bgr):
+            # Deep SR is reserved for genuinely tiny crops; on larger manual crops it is slow and can hallucinate.
+            enhanced, method, _ = self.enhancement_service.enhance_plate_crop_with_metadata(
+                crop_bgr,
+                allow_realesrgan=True,
+                allow_opencv_fallback=True,
+            )
+            enhanced = self._resize_manual_variant(enhanced)
+            variants.append((f"manual_{method}_color", self._manual_text_cleanup(enhanced), True))
+            variants.append((f"manual_{method}_binary", self._build_binary_ocr_image(enhanced), False))
+
+        # Classical interpolation path: Lanczos keeps plate edges sharper than plain bicubic on tiny crops.
+        lanczos = self._manual_upscale(crop_bgr, scale, cv2.INTER_LANCZOS4)
+        variants.append(("manual_lanczos_cleanup", self._manual_text_cleanup(lanczos), True))
+
+        # Bicubic produces a smoother alternative; it often avoids ringing artifacts from Lanczos.
+        bicubic = self._manual_upscale(crop_bgr, scale, cv2.INTER_CUBIC)
+        variants.append(("manual_bicubic_cleanup", self._manual_text_cleanup(bicubic), True))
+
+        # Deblocking smooths square pixel artifacts before sharpening character strokes again.
+        variants.append(("manual_deblocked_cleanup", self._manual_depixelate_cleanup(lanczos), True))
+
+        # Low-light/glare variants compress washed-out plate backgrounds before OCR looks for characters.
+        variants.append(("manual_glare_controlled", self._manual_glare_controlled_image(lanczos), True))
+        variants.append(("manual_contrast_stretched", self._manual_contrast_stretched_image(lanczos), False))
+
+        # Binary variants are useful when the plate background is uneven or low contrast.
+        variants.append(("manual_adaptive_binary", self._build_binary_ocr_image(lanczos), False))
+        variants.append(("manual_otsu_closed", self._manual_otsu_closed_image(lanczos), False))
+        variants.append(("manual_blackhat_binary", self._manual_blackhat_binary_image(lanczos), False))
+
+        return variants
+
+    @classmethod
+    def _best_voted_ocr_result(cls, attempts: list[dict]) -> dict:
+        voted_candidates = cls._rank_attempt_candidates(attempts)
+        if not voted_candidates:
+            return cls._best_ocr_result(attempts)
+
+        return {
+            "text": voted_candidates[0]["plate"],
+            "ocr_confidence": voted_candidates[0]["confidence"],
+            "candidates": voted_candidates[: cls.MAX_ALTERNATE_CANDIDATES],
+            "variant": "manual_restoration_vote",
+            "raw_ocr": {
+                "variant": "manual_restoration_vote",
+                "items": [],
+            },
+        }
+
+    @classmethod
+    def _choose_manual_result(cls, direct_result: dict, restored_result: dict) -> dict:
+        direct_text = str(direct_result.get("text", ""))
+        restored_text = str(restored_result.get("text", ""))
+        direct_confidence = float(direct_result.get("ocr_confidence", 0.0))
+        restored_confidence = float(restored_result.get("ocr_confidence", 0.0))
+        direct_valid = PlateCandidateGenerator.matches_plate_pattern(direct_text)
+        restored_valid = PlateCandidateGenerator.matches_plate_pattern(restored_text)
+
+        if not restored_text:
+            return direct_result
+
+        if direct_valid and not restored_valid:
+            return direct_result
+
+        if restored_valid and not direct_valid:
+            return restored_result
+
+        if direct_valid and restored_valid:
+            if restored_text == direct_text:
+                return restored_result if restored_confidence > direct_confidence else direct_result
+
+            if direct_confidence >= cls.MANUAL_DIRECT_ACCEPT_CONFIDENCE:
+                required_confidence = direct_confidence + cls.MANUAL_RESTORE_REPLACE_MARGIN
+                return restored_result if restored_confidence >= required_confidence else direct_result
+
+        if direct_text and len(restored_text) < len(direct_text) and restored_confidence < direct_confidence + 0.2:
+            return direct_result
+
+        return restored_result if restored_confidence > direct_confidence else direct_result
+
+    @classmethod
+    def _rank_attempt_candidates(cls, attempts: list[dict]) -> list[dict[str, str | float]]:
+        candidate_votes: list[dict[str, str | float | int]] = []
+        for attempt in attempts:
+            variant = str(attempt.get("variant", "unknown"))
+            seen_for_variant: set[str] = set()
+            text = str(attempt.get("text", ""))
+            if text:
+                candidate_votes.append(
+                    {
+                        "plate": text,
+                        "confidence": float(attempt.get("ocr_confidence", 0.0)),
+                        "rank": 0,
+                        "variant": variant,
+                    }
+                )
+                seen_for_variant.add(text)
+
+            for rank, candidate in enumerate(attempt.get("candidates", [])[: cls.MAX_VARIANT_CANDIDATES], start=1):
+                plate = str(candidate.get("plate", ""))
+                if not plate or plate in seen_for_variant:
+                    continue
+
+                candidate_votes.append(
+                    {
+                        "plate": plate,
+                        "confidence": float(candidate.get("confidence", 0.0)),
+                        "rank": rank,
+                        "variant": variant,
+                    }
+                )
+                seen_for_variant.add(plate)
+
+        return cls._vote_candidates(candidate_votes)
 
     def _prepare_crop_for_ocr(self, crop_bgr: np.ndarray, quality_score: float) -> tuple[np.ndarray, str]:
         height, width = crop_bgr.shape[:2]
@@ -196,19 +384,45 @@ class OCRService:
         # Large but blurry crops skip super-resolution and use cheap local enhancement.
         return self._apply_mild_preprocessing(crop_bgr), f"large_low_quality_preprocess_{width}x{height}"
 
-    def _read_plate_variant(self, image: np.ndarray, variant: str, input_is_bgr: bool) -> dict:
+    def _read_plate_variant(
+        self,
+        image: np.ndarray,
+        variant: str,
+        input_is_bgr: bool,
+        high_accuracy: bool = False,
+    ) -> dict:
         easyocr_image = self._to_easyocr_image(image, input_is_bgr=input_is_bgr)
-        results = self.reader.readtext(
-            easyocr_image,
-            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-            detail=1,
-            paragraph=False,
-            min_size=10,
-            contrast_ths=0.1,
-            adjust_contrast=0.5,
-            text_threshold=0.6,
-            low_text=0.3,
-        )
+        readtext_options = {
+            "allowlist": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "detail": 1,
+            "paragraph": False,
+            "min_size": 10,
+            "contrast_ths": 0.1,
+            "adjust_contrast": 0.5,
+            "text_threshold": 0.6,
+            "low_text": 0.3,
+        }
+        if high_accuracy:
+            height, width = easyocr_image.shape[:2]
+            mag_ratio = 1.2 if width >= 240 or height >= 72 else 1.8
+            readtext_options.update(
+                {
+                    "decoder": "beamsearch",
+                    "beamWidth": 8,
+                    "min_size": 6,
+                    "text_threshold": 0.5,
+                    "low_text": 0.25,
+                    "link_threshold": 0.3,
+                    "mag_ratio": mag_ratio,
+                    "slope_ths": 0.25,
+                    "ycenter_ths": 0.7,
+                    "height_ths": 0.7,
+                    "width_ths": 0.8,
+                    "add_margin": 0.08,
+                }
+            )
+
+        results = self.reader.readtext(easyocr_image, **readtext_options)
         parsed = self._parse_results(results)
         parsed["variant"] = variant
         parsed["raw_ocr"] = {
@@ -244,6 +458,186 @@ class OCRService:
         # A light unsharp mask restores glyph edges for mildly blurred crops.
         blurred = cv2.GaussianBlur(contrast_bgr, (0, 0), 1.2)
         return cv2.addWeighted(contrast_bgr, 1.35, blurred, -0.35, 0)
+
+    @classmethod
+    def _manual_upscale_factor(cls, width: int, height: int) -> int:
+        if width <= 0 or height <= 0:
+            return 1
+
+        if height >= cls.MANUAL_RESTORE_TARGET_HEIGHT and width >= 180:
+            return 1
+
+        height_scale = max(1, int(np.ceil(cls.MANUAL_RESTORE_TARGET_HEIGHT / max(height, 1))))
+        scale = min(6, max(2, height_scale))
+        if width * scale > cls.MANUAL_RESTORE_MAX_WIDTH:
+            scale = max(1, cls.MANUAL_RESTORE_MAX_WIDTH // max(width, 1))
+
+        return scale
+
+    @staticmethod
+    def _manual_upscale(image: np.ndarray, scale: int, interpolation: int) -> np.ndarray:
+        height, width = image.shape[:2]
+        scale = max(1, int(scale))
+        if scale == 1:
+            return image.copy()
+
+        return cv2.resize(image, (width * scale, height * scale), interpolation=interpolation)
+
+    @classmethod
+    def _resize_manual_variant(cls, image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        if height >= cls.MANUAL_RESTORE_TARGET_HEIGHT or width <= 0:
+            return image
+
+        scale = cls._manual_upscale_factor(width, height)
+        return cls._manual_upscale(image, scale, cv2.INTER_CUBIC)
+
+    @staticmethod
+    def _manual_text_cleanup(image: np.ndarray) -> np.ndarray:
+        image = OCRService._ensure_bgr(image)
+
+        # Stage 1: denoise after upscaling so compression blocks do not become OCR strokes.
+        denoised = cv2.fastNlMeansDenoisingColored(
+            image,
+            None,
+            h=7,
+            hColor=7,
+            templateWindowSize=7,
+            searchWindowSize=21,
+        )
+
+        # Stage 2: CLAHE on LAB lightness separates dark glyphs from faded plate backgrounds.
+        lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
+        lightness, channel_a, channel_b = cv2.split(lab)
+        lightness = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(lightness)
+        contrast_bgr = cv2.cvtColor(cv2.merge((lightness, channel_a, channel_b)), cv2.COLOR_LAB2BGR)
+
+        # Stage 3: unsharp masking restores character edges after denoising and contrast normalization.
+        blurred = cv2.GaussianBlur(contrast_bgr, (0, 0), 2.0)
+        return cv2.addWeighted(contrast_bgr, 1.55, blurred, -0.55, 0)
+
+    @staticmethod
+    def _manual_depixelate_cleanup(image: np.ndarray) -> np.ndarray:
+        image = OCRService._ensure_bgr(image)
+
+        # Pixelated crops have square block edges; bilateral filtering smooths blocks while retaining glyph borders.
+        deblocked = cv2.bilateralFilter(image, 7, 60, 60)
+        return OCRService._manual_text_cleanup(deblocked)
+
+    @staticmethod
+    def _manual_glare_controlled_image(image: np.ndarray) -> np.ndarray:
+        image = OCRService._ensure_bgr(image)
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        lightness, channel_a, channel_b = cv2.split(lab)
+        lightness = OCRService._compress_gray_highlights(lightness)
+        lightness = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(6, 6)).apply(lightness)
+        contrast_bgr = cv2.cvtColor(cv2.merge((lightness, channel_a, channel_b)), cv2.COLOR_LAB2BGR)
+        blurred = cv2.GaussianBlur(contrast_bgr, (0, 0), 1.5)
+        return cv2.addWeighted(contrast_bgr, 1.45, blurred, -0.45, 0)
+
+    @staticmethod
+    def _manual_contrast_stretched_image(image: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(OCRService._ensure_bgr(image), cv2.COLOR_BGR2GRAY)
+        low, high = np.percentile(gray, (2, 98))
+        if high - low < 8:
+            return gray
+
+        stretched = ((gray.astype(np.float32) - low) * (255.0 / (high - low))).clip(0, 255).astype(np.uint8)
+        stretched = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(stretched)
+        return OCRService._sharpen(stretched)
+
+    @staticmethod
+    def _manual_otsu_closed_image(image: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(OCRService._ensure_bgr(image), cv2.COLOR_BGR2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4)).apply(gray)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Closing reconnects broken character strokes caused by pixelation or low-resolution crops.
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        return cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    @staticmethod
+    def _manual_blackhat_binary_image(image: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(OCRService._ensure_bgr(image), cv2.COLOR_BGR2GRAY)
+        gray = OCRService._compress_gray_highlights(gray)
+        gray = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4)).apply(gray)
+        height, width = gray.shape[:2]
+        kernel_width = max(15, min(61, (width // 8) | 1))
+        kernel_height = max(5, min(17, (height // 3) | 1))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, kernel_height))
+        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+        blackhat = cv2.normalize(blackhat, None, 0, 255, cv2.NORM_MINMAX)
+        _, binary = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+        )
+        return cv2.bitwise_not(binary)
+
+    @staticmethod
+    def _normalize_manual_plate_region(image: np.ndarray) -> np.ndarray:
+        image = OCRService._ensure_bgr(image)
+        height, width = image.shape[:2]
+        if height < 24 or width < 60:
+            return image
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)),
+        )
+
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        image_area = float(width * height)
+        best_box = None
+        best_score = 0.0
+        for contour in contours:
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            if box_width <= 0 or box_height <= 0:
+                continue
+
+            box_area = float(box_width * box_height)
+            aspect_ratio = box_width / max(box_height, 1)
+            area_ratio = box_area / max(image_area, 1.0)
+            if not (1.8 <= aspect_ratio <= 8.0):
+                continue
+            if area_ratio < 0.08 or box_width < width * 0.25 or box_height < height * 0.12:
+                continue
+
+            contour_fill = cv2.contourArea(contour) / max(box_area, 1.0)
+            center_x = x + (box_width / 2.0)
+            center_y = y + (box_height / 2.0)
+            center_penalty = (abs(center_x - (width / 2.0)) / max(width, 1)) + (
+                abs(center_y - (height / 2.0)) / max(height, 1)
+            )
+            ratio_score = max(0.0, 1.0 - (abs(aspect_ratio - 4.2) / 4.2))
+            score = box_area * (0.7 + ratio_score) * max(0.3, contour_fill) * max(0.4, 1.0 - center_penalty)
+            if score > best_score:
+                best_score = score
+                best_box = (x, y, box_width, box_height, area_ratio)
+
+        if best_box is None:
+            return image
+
+        x, y, box_width, box_height, area_ratio = best_box
+        if area_ratio > 0.92:
+            return image
+
+        pad_x = max(2, int(box_width * 0.04))
+        pad_y = max(2, int(box_height * 0.15))
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(width, x + box_width + pad_x)
+        y2 = min(height, y + box_height + pad_y)
+        if x2 - x1 < 40 or y2 - y1 < 16:
+            return image
+
+        return image[y1:y2, x1:x2]
 
     @staticmethod
     def _to_easyocr_image(image: np.ndarray, input_is_bgr: bool) -> np.ndarray:
@@ -724,22 +1118,31 @@ class OCRService:
             variant_count = len(stats["variants"])
             average_confidence = stats["weighted_sum"] / max(stats["weight"], 0.01)
             agreement_bonus = min(max(variant_count - 1, 0), 4) * 0.04
+            is_valid_plate = PlateCandidateGenerator.matches_plate_pattern(plate)
+            fragment_penalty = 0.18 if len(plate) < 8 else 0.0
             confidence = min(
                 1.0,
                 (average_confidence * 0.75) + (stats["max_confidence"] * 0.25) + agreement_bonus,
             )
-            ranking_score = confidence + min(max(variant_count - 1, 0), 4) * 0.08
+            ranking_score = (
+                confidence
+                + min(max(variant_count - 1, 0), 4) * 0.08
+                + (0.22 if is_valid_plate else 0.0)
+                - fragment_penalty
+            )
             ranked_candidates.append(
                 {
                     "plate": plate,
                     "confidence": round(confidence, 4),
                     "_score": ranking_score,
                     "_variant_count": variant_count,
+                    "_is_valid_plate": is_valid_plate,
                 }
             )
 
         ranked_candidates.sort(
             key=lambda candidate: (
+                candidate["_is_valid_plate"],
                 candidate["_score"],
                 candidate["_variant_count"],
                 candidate["confidence"],
@@ -770,6 +1173,9 @@ class OCRService:
         if not cleaned_text:
             return []
 
+        if len(cleaned_text) < self.MIN_STANDARD_PLATE_LENGTH and not self.plate_validator.validate(cleaned_text):
+            return []
+
         # First pass favors exact OCR plus position-aware Indian-format substitutions.
         candidates = self.candidate_generator.generate(
             cleaned_text,
@@ -778,6 +1184,25 @@ class OCRService:
             max_candidates=self.MAX_ALTERNATE_CANDIDATES,
             regex_boost_enabled=True,
         )
+        missing_state_candidates = self._missing_state_prefix_candidates(cleaned_text, base_confidence)
+        if missing_state_candidates:
+            merged_candidates = {str(candidate["plate"]): float(candidate["confidence"]) for candidate in candidates}
+            for candidate in missing_state_candidates:
+                plate = str(candidate["plate"])
+                confidence = float(candidate["confidence"])
+                merged_candidates[plate] = max(merged_candidates.get(plate, 0.0), confidence)
+            candidates = [
+                {"plate": plate, "confidence": round(confidence, 4)}
+                for plate, confidence in sorted(
+                    merged_candidates.items(),
+                    key=lambda item: (
+                        PlateCandidateGenerator.matches_plate_pattern(item[0]),
+                        item[1],
+                        len(item[0]),
+                    ),
+                    reverse=True,
+                )[: self.MAX_ALTERNATE_CANDIDATES]
+            ]
 
         needs_validator_recovery = len(cleaned_text) > 10 or not any(
             PlateCandidateGenerator.matches_plate_pattern(str(candidate["plate"]))
@@ -825,4 +1250,51 @@ class OCRService:
                 ),
                 reverse=True,
             )[: self.MAX_ALTERNATE_CANDIDATES]
+        ]
+
+    @classmethod
+    def _missing_state_prefix_candidates(cls, text: str, base_confidence: float) -> list[dict[str, str | float]]:
+        normalized = cls._normalize_plate_text(text)
+        if len(normalized) < 8 or not re.fullmatch(r"[A-Z][0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}", normalized):
+            return []
+
+        visible_state_char = normalized[0]
+        remainder_after_visible = normalized[1:]
+        common_state_priority = {
+            "TS": 0.08,
+            "KA": 0.07,
+            "MH": 0.07,
+            "AP": 0.06,
+            "DL": 0.06,
+            "TN": 0.05,
+            "HR": 0.05,
+            "KL": 0.04,
+            "UP": 0.04,
+        }
+        candidate_scores: dict[str, float] = {}
+
+        for state_code in cls.INDIAN_STATE_CODES:
+            possible_plates = []
+            if state_code[0] == visible_state_char:
+                possible_plates.append(state_code + remainder_after_visible)
+            if state_code[1] == visible_state_char:
+                possible_plates.append(state_code[0] + normalized)
+
+            for plate in possible_plates:
+                if not PlateCandidateGenerator.matches_plate_pattern(plate):
+                    continue
+
+                confidence = min(
+                    0.92,
+                    (base_confidence * 0.82) + common_state_priority.get(state_code, 0.0),
+                )
+                candidate_scores[plate] = max(candidate_scores.get(plate, 0.0), confidence)
+
+        return [
+            {"plate": plate, "confidence": round(confidence, 4)}
+            for plate, confidence in sorted(
+                candidate_scores.items(),
+                key=lambda item: (item[1], item[0]),
+                reverse=True,
+            )[: cls.MAX_ALTERNATE_CANDIDATES]
         ]

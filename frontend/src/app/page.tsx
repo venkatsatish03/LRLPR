@@ -1,7 +1,7 @@
 "use client";
 
-import { ChangeEvent, CSSProperties, DragEvent, useEffect, useMemo, useRef, useState } from "react";
-import { detectLicensePlateDetails, resolveAssetUrl } from "@/services/api";
+import { ChangeEvent, CSSProperties, DragEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { detectLicensePlateDetails, detectManualPlateCrop, resolveAssetUrl } from "@/services/api";
 import type { PlateDetection, PlateDetectionResponse } from "@/types/detection";
 
 type ExportDetection = {
@@ -35,12 +35,24 @@ type QualityStatus = {
   tone: "strong" | "review" | "weak" | "empty";
 };
 
+type ManualSelection = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+};
+
 export default function Home() {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const manualImageRef = useRef<HTMLImageElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [isDetecting, setIsDetecting] = useState(false);
+  const [isManualAnalyzing, setIsManualAnalyzing] = useState(false);
+  const [isManualMode, setIsManualMode] = useState(false);
+  const [isSelectingManualRegion, setIsSelectingManualRegion] = useState(false);
+  const [manualSelection, setManualSelection] = useState<ManualSelection | null>(null);
   const [result, setResult] = useState<PlateDetectionResponse | null>(null);
   const [processingTimeMs, setProcessingTimeMs] = useState<number | null>(null);
   const [processedAt, setProcessedAt] = useState<string | null>(null);
@@ -65,6 +77,24 @@ export default function Home() {
   const storedOriginalUrl = result ? resolveAssetUrl(`/uploads/${result.filename}`) : "";
   const originalImageUrl = previewUrl || storedOriginalUrl;
   const candidateRows = useMemo(() => buildCandidateRows(bestDetection), [bestDetection]);
+  const shouldShowManualReview = Boolean(
+    file && (isManualMode || (result && (result.plates_detected === 0 || !bestDetection?.text))),
+  );
+  const manualSelectionBox = normalizeSelection(manualSelection);
+  const manualSelectionStyle = manualSelectionBox
+    ? ({
+        left: `${manualSelectionBox.x1 * 100}%`,
+        top: `${manualSelectionBox.y1 * 100}%`,
+        width: `${(manualSelectionBox.x2 - manualSelectionBox.x1) * 100}%`,
+        height: `${(manualSelectionBox.y2 - manualSelectionBox.y1) * 100}%`,
+      } as CSSProperties)
+    : undefined;
+  const manualCropCoordinates = getManualCropCoordinates(manualSelectionBox, manualImageRef.current);
+  const hasManualSelection = Boolean(
+    manualCropCoordinates &&
+      manualCropCoordinates.x2 - manualCropCoordinates.x1 >= 8 &&
+      manualCropCoordinates.y2 - manualCropCoordinates.y1 >= 4,
+  );
 
   function handleFile(selectedFile?: File) {
     if (!selectedFile) return;
@@ -78,6 +108,8 @@ export default function Home() {
     setResult(null);
     setProcessingTimeMs(null);
     setProcessedAt(null);
+    setIsManualMode(false);
+    setManualSelection(null);
     setError("");
   }
 
@@ -102,6 +134,7 @@ export default function Home() {
     setResult(null);
     setProcessingTimeMs(null);
     setProcessedAt(null);
+    setManualSelection(null);
 
     const startTime = performance.now();
     try {
@@ -116,11 +149,68 @@ export default function Home() {
     }
   }
 
+  async function handleManualDetect() {
+    if (!file) {
+      setError("Select an evidence image first.");
+      return;
+    }
+
+    const coordinates = getManualCropCoordinates(normalizeSelection(manualSelection), manualImageRef.current);
+    if (!coordinates || coordinates.x2 - coordinates.x1 < 8 || coordinates.y2 - coordinates.y1 < 4) {
+      setError("Select a larger plate region.");
+      return;
+    }
+
+    setIsManualAnalyzing(true);
+    setError("");
+    const startTime = performance.now();
+    try {
+      const detection = await detectManualPlateCrop(file, coordinates);
+      setProcessingTimeMs(Math.round(performance.now() - startTime));
+      setProcessedAt(new Date().toISOString());
+      setResult(detection);
+      setIsManualMode(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Manual plate analysis failed.");
+    } finally {
+      setIsManualAnalyzing(false);
+    }
+  }
+
+  function handleManualPointerDown(event: PointerEvent<HTMLDivElement>) {
+    if (!file || isManualAnalyzing) return;
+
+    const point = getManualPoint(event, manualImageRef.current);
+    if (!point) return;
+
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setIsSelectingManualRegion(true);
+    setManualSelection({ x1: point.x, y1: point.y, x2: point.x, y2: point.y });
+  }
+
+  function handleManualPointerMove(event: PointerEvent<HTMLDivElement>) {
+    if (!isSelectingManualRegion) return;
+
+    const point = getManualPoint(event, manualImageRef.current);
+    if (!point) return;
+
+    setManualSelection((selection) => (selection ? { ...selection, x2: point.x, y2: point.y } : selection));
+  }
+
+  function handleManualPointerUp(event: PointerEvent<HTMLDivElement>) {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setIsSelectingManualRegion(false);
+  }
+
   function clearCase() {
     setFile(null);
     setResult(null);
     setProcessingTimeMs(null);
     setProcessedAt(null);
+    setIsManualMode(false);
+    setManualSelection(null);
     setError("");
     if (inputRef.current) inputRef.current.value = "";
   }
@@ -184,6 +274,14 @@ export default function Home() {
           <button className="primary-button" type="button" disabled={!file || isDetecting} onClick={handleDetect}>
             {isDetecting ? "Analyzing" : "Analyze"}
           </button>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={!file}
+            onClick={() => setIsManualMode((current) => !current)}
+          >
+            Manual
+          </button>
           <button className="secondary-button" type="button" disabled={!result} onClick={downloadPdf}>
             PDF
           </button>
@@ -232,6 +330,49 @@ export default function Home() {
               </figure>
             </div>
           </section>
+
+          {shouldShowManualReview && (
+            <section className="panel manual-panel" aria-label="Manual plate region selection">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">Manual Review</p>
+                  <h2>Selected Plate Region</h2>
+                </div>
+                <span className="panel-count">{formatManualSelection(manualCropCoordinates)}</span>
+              </div>
+
+              <div className={`manual-crop-stage ${isSelectingManualRegion ? "is-selecting" : ""}`}>
+                {originalImageUrl ? (
+                  <div
+                    className="manual-image-wrap"
+                    onPointerDown={handleManualPointerDown}
+                    onPointerMove={handleManualPointerMove}
+                    onPointerUp={handleManualPointerUp}
+                    onPointerCancel={handleManualPointerUp}
+                  >
+                    <img ref={manualImageRef} src={originalImageUrl} alt="Manual plate region source" draggable={false} />
+                    {manualSelectionStyle && <span className="manual-selection-box" style={manualSelectionStyle} />}
+                  </div>
+                ) : (
+                  <div className="empty-section">Awaiting image</div>
+                )}
+              </div>
+
+              <div className="manual-actions">
+                <button
+                  className="primary-button"
+                  type="button"
+                  disabled={!hasManualSelection || isManualAnalyzing}
+                  onClick={handleManualDetect}
+                >
+                  {isManualAnalyzing ? "Reading" : "Manual OCR"}
+                </button>
+                <button className="secondary-button" type="button" onClick={() => setManualSelection(null)}>
+                  Reset
+                </button>
+              </div>
+            </section>
+          )}
 
           <section className="panel crop-panel" aria-label="Plate crop previews">
             <div className="panel-heading">
@@ -392,6 +533,46 @@ function getQualityStatus(score: number, platesDetected: number): QualityStatus 
   if (score >= 82) return { label: "High Confidence", tone: "strong" };
   if (score >= 62) return { label: "Review", tone: "review" };
   return { label: "Low Confidence", tone: "weak" };
+}
+
+function getManualPoint(event: PointerEvent<HTMLDivElement>, image: HTMLImageElement | null) {
+  if (!image) return null;
+
+  const rect = image.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+
+  return {
+    x: clamp((event.clientX - rect.left) / rect.width, 0, 1),
+    y: clamp((event.clientY - rect.top) / rect.height, 0, 1),
+  };
+}
+
+function normalizeSelection(selection: ManualSelection | null): ManualSelection | null {
+  if (!selection) return null;
+
+  return {
+    x1: Math.min(selection.x1, selection.x2),
+    y1: Math.min(selection.y1, selection.y2),
+    x2: Math.max(selection.x1, selection.x2),
+    y2: Math.max(selection.y1, selection.y2),
+  };
+}
+
+function getManualCropCoordinates(selection: ManualSelection | null, image: HTMLImageElement | null) {
+  if (!selection || !image || image.naturalWidth <= 0 || image.naturalHeight <= 0) return null;
+
+  return {
+    x1: Math.round(selection.x1 * image.naturalWidth),
+    y1: Math.round(selection.y1 * image.naturalHeight),
+    x2: Math.round(selection.x2 * image.naturalWidth),
+    y2: Math.round(selection.y2 * image.naturalHeight),
+  };
+}
+
+function formatManualSelection(coordinates: { x1: number; y1: number; x2: number; y2: number } | null): string {
+  if (!coordinates) return "No selection";
+
+  return `${Math.max(0, coordinates.x2 - coordinates.x1)} x ${Math.max(0, coordinates.y2 - coordinates.y1)} px`;
 }
 
 function buildCandidateRows(bestDetection: PlateDetection | null) {

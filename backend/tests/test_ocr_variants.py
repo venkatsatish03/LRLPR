@@ -123,6 +123,30 @@ class OCRVariantTest(unittest.TestCase):
 
         self.assertEqual(parsed["text"], "MH47BP8265")
 
+    def test_rejects_short_high_confidence_fragments_as_plate_reads(self) -> None:
+        service = OCRService()
+        results = [
+            ([[0, 0], [60, 0], [60, 30], [0, 30]], "97", 0.92),
+            ([[70, 0], [120, 0], [120, 30], [70, 30]], "G7", 0.76),
+        ]
+
+        parsed = service._parse_results(results)
+
+        self.assertEqual(parsed["text"], "")
+        self.assertEqual(parsed["candidates"], [])
+
+    def test_recovers_missing_state_prefix_letter_from_single_state_char(self) -> None:
+        service = OCRService()
+        candidates = service._generate_plate_candidates("S09FA3499", 0.62)
+
+        self.assertEqual(candidates[0]["plate"], "TS09FA3499")
+
+    def test_recovers_missing_second_state_letter_from_single_state_char(self) -> None:
+        service = OCRService()
+        candidates = service._generate_plate_candidates("T09FA3499", 0.62)
+
+        self.assertEqual(candidates[0]["plate"], "TS09FA3499")
+
 
 if __name__ == "__main__":
     unittest.main()
