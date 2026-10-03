@@ -647,6 +647,19 @@ class PlateDetectorService:
         final_confidence = self._combined_confidence(confidence, ocr_confidence, str(ocr_result["text"]))
         x1, y1, x2, y2 = coordinates
 
+        blended_candidates = []
+        for cand in ocr_result.get("candidates", []):
+            cand_plate = str(cand["plate"])
+            cand_ocr_conf = float(cand["confidence"])
+            cand_final_conf = self._combined_confidence(confidence, cand_ocr_conf, cand_plate)
+            cand_final_conf = min(cand_final_conf, final_confidence)
+            blended_candidates.append(
+                {
+                    "plate": cand_plate,
+                    "confidence": round(cand_final_conf, 4),
+                }
+            )
+
         return {
             "confidence": round(float(confidence), 4),
             "final_confidence": final_confidence,
@@ -660,7 +673,7 @@ class PlateDetectorService:
             "cropped_plate_url": f"/uploads/plates/{crop_filename}",
             "text": ocr_result["text"],
             "ocr_confidence": round(ocr_confidence, 4),
-            "candidates": ocr_result["candidates"],
+            "candidates": blended_candidates,
         }
 
     @staticmethod
@@ -1127,6 +1140,13 @@ class PlateDetectorService:
     def _crop_candidate(image, candidate: dict, expanded_box: tuple[int, int, int, int]):
         points = candidate.get("points")
         if points is not None:
+            rect = cv2.minAreaRect(points.astype("float32"))
+            angle = abs(rect[2])
+            # If the tilt angle is small, direct slicing with expanded_box preserves crisp unwarped pixels and margins
+            if angle <= 12 or abs(angle - 90) <= 12:
+                x1, y1, x2, y2 = expanded_box
+                return image[y1:y2, x1:x2]
+
             crop = PlateDetectorService._crop_rotated_region(image, points)
             if crop is not None and crop.size > 0:
                 return crop
@@ -1135,7 +1155,7 @@ class PlateDetectorService:
         return image[y1:y2, x1:x2]
 
     @staticmethod
-    def _crop_rotated_region(image, points):
+    def _crop_rotated_region(image, points, pad_x_ratio: float = 0.08, pad_y_ratio: float = 0.16):
         ordered_points = PlateDetectorService._order_points(points.astype("float32"))
         top_width = np.linalg.norm(ordered_points[1] - ordered_points[0])
         bottom_width = np.linalg.norm(ordered_points[2] - ordered_points[3])
@@ -1147,17 +1167,36 @@ class PlateDetectorService:
         if width <= 0 or height <= 0:
             return None
 
+        # Expand rotated box with margins to avoid clipping edge characters
+        u_w = (ordered_points[1] - ordered_points[0]) / max(top_width, 1e-4)
+        u_h = (ordered_points[3] - ordered_points[0]) / max(left_height, 1e-4)
+        pad_x = width * pad_x_ratio
+        pad_y = height * pad_y_ratio
+
+        exp_points = np.zeros_like(ordered_points)
+        exp_points[0] = ordered_points[0] - u_w * pad_x - u_h * pad_y
+        exp_points[1] = ordered_points[1] + u_w * pad_x - u_h * pad_y
+        exp_points[2] = ordered_points[2] + u_w * pad_x + u_h * pad_y
+        exp_points[3] = ordered_points[3] - u_w * pad_x + u_h * pad_y
+
+        image_height, image_width = image.shape[:2]
+        exp_points[:, 0] = np.clip(exp_points[:, 0], 0, image_width - 1)
+        exp_points[:, 1] = np.clip(exp_points[:, 1], 0, image_height - 1)
+
+        new_width = int(round(width + 2 * pad_x))
+        new_height = int(round(height + 2 * pad_y))
+
         destination = np.array(
             [
                 [0, 0],
-                [width - 1, 0],
-                [width - 1, height - 1],
-                [0, height - 1],
+                [new_width - 1, 0],
+                [new_width - 1, new_height - 1],
+                [0, new_height - 1],
             ],
             dtype="float32",
         )
-        transform = cv2.getPerspectiveTransform(ordered_points, destination)
-        crop = cv2.warpPerspective(image, transform, (width, height))
+        transform = cv2.getPerspectiveTransform(exp_points, destination)
+        crop = cv2.warpPerspective(image, transform, (new_width, new_height))
         if crop.shape[0] > crop.shape[1]:
             crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
         return crop

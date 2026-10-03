@@ -587,13 +587,15 @@ function buildCandidateRows(bestDetection: PlateDetection | null) {
   ];
   const seen = new Set<string>();
 
-  return rows
-    .filter((candidate) => {
-      const key = candidate.plate.toUpperCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
+  const unique = rows.filter((candidate) => {
+    const key = candidate.plate.toUpperCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return unique
+    .sort((a, b) => b.confidence - a.confidence)
     .slice(0, 10);
 }
 

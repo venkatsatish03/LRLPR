@@ -52,6 +52,40 @@ class PlateCandidateGenerator:
         "UP",
         "WB",
     }
+    STATE_POS0_CONFUSIONS = {
+        "I": [("D", 0.03), ("T", 0.05), ("J", 0.06)],
+        "1": [("D", 0.03), ("T", 0.05), ("J", 0.06)],
+        "J": [("D", 0.04), ("T", 0.06)],
+        "T": [("D", 0.05)],
+        "0": [("D", 0.04), ("A", 0.06), ("U", 0.07)],
+        "O": [("D", 0.04), ("A", 0.06), ("U", 0.07)],
+        "Q": [("D", 0.05), ("G", 0.06)],
+        "C": [("D", 0.05), ("G", 0.06), ("M", 0.08)],
+        "L": [("D", 0.04)],
+        "7": [("T", 0.04), ("Z", 0.06)],
+        "4": [("M", 0.05), ("A", 0.06)],
+        "H": [("M", 0.06)],
+        "N": [("M", 0.05), ("H", 0.06)],
+        "K": [("H", 0.06)],
+        "8": [("B", 0.04)],
+        "P": [("B", 0.05), ("R", 0.06)],
+        "R": [("P", 0.05), ("B", 0.06)],
+        "U": [("V", 0.05)],
+        "V": [("U", 0.05), ("W", 0.06)],
+        "W": [("M", 0.06)],
+    }
+    STATE_POS1_CONFUSIONS = {
+        "1": [("L", 0.03), ("T", 0.06)],
+        "I": [("L", 0.03), ("T", 0.06)],
+        "7": [("L", 0.05), ("T", 0.05)],
+        "5": [("S", 0.03)],
+        "8": [("S", 0.05), ("B", 0.05)],
+        "Z": [("S", 0.05)],
+        "4": [("H", 0.06), ("A", 0.06)],
+        "0": [("D", 0.04), ("A", 0.06)],
+        "O": [("D", 0.04), ("A", 0.06)],
+        "6": [("G", 0.04), ("C", 0.06)],
+    }
     RTO_DIGIT_SLOT_REPLACEMENTS = {
         "O": [("0", 0.025)],
         "D": [("0", 0.035)],
@@ -63,11 +97,25 @@ class PlateCandidateGenerator:
         "G": [("6", 0.035)],
         "C": [("0", 0.055)],
         "T": [("7", 0.05)],
+        "7": [("0", 0.05), ("1", 0.05)],
         "Z": [("7", 0.04), ("2", 0.075)],
     }
     SERIAL_DIGIT_SLOT_REPLACEMENTS = {
         **RTO_DIGIT_SLOT_REPLACEMENTS,
         "Z": [("2", 0.04), ("7", 0.08)],
+    }
+    SERIES_LETTER_REPLACEMENTS = {
+        "0": [("Q", 0.02), ("D", 0.04), ("C", 0.06), ("G", 0.06), ("B", 0.07)],
+        "O": [("Q", 0.02), ("D", 0.04), ("C", 0.06), ("G", 0.06), ("B", 0.07)],
+        "Q": [("D", 0.03)],
+        "D": [("Q", 0.03)],
+        "1": [("L", 0.03), ("T", 0.05), ("J", 0.06)],
+        "I": [("L", 0.03), ("T", 0.05), ("J", 0.06)],
+        "8": [("B", 0.03)],
+        "5": [("S", 0.03)],
+        "2": [("Z", 0.03)],
+        "6": [("G", 0.03), ("C", 0.06)],
+        "H": [("A", 0.05)],
     }
     LETTER_SLOT_REPLACEMENTS = {
         "0": [("Q", 0.035), ("D", 0.075), ("O", 0.095)],
@@ -162,6 +210,7 @@ class PlateCandidateGenerator:
         for candidate, confidence in self._compacted_rto_candidates(normalized, base_confidence, regex_boost_enabled):
             candidate_scores[candidate] = max(candidate_scores.get(candidate, 0.0), confidence)
 
+        has_valid_already = any(self.matches_plate_pattern(c) for c in candidate_scores)
         for index, char in enumerate(normalized):
             char_confidence = char_confidences[index]
             for replacement in sorted(self.CONFUSIONS.get(char, set())):
@@ -169,7 +218,10 @@ class PlateCandidateGenerator:
                 if candidate == normalized:
                     continue
 
-                # Replacing one weak character is plausible; deleting trailing chars was not.
+                is_valid = self.matches_plate_pattern(candidate)
+                if has_valid_already and not is_valid:
+                    continue
+
                 candidate_scores[candidate] = max(
                     candidate_scores.get(candidate, 0.0),
                     self._score_substitution(
@@ -182,13 +234,27 @@ class PlateCandidateGenerator:
                     ),
                 )
 
+        sorted_candidates = sorted(
+            candidate_scores.items(),
+            key=lambda item: (
+                self.matches_plate_pattern(item[0]),
+                item[1],
+                len(item[0]),
+            ),
+            reverse=True,
+        )
+
+        valid_items = [item for item in sorted_candidates if self.matches_plate_pattern(item[0])]
+        if valid_items:
+            final_items = valid_items[:max_candidates]
+            if len(final_items) < max_candidates and normalized not in {p for p, _ in final_items}:
+                final_items.append((normalized, candidate_scores[normalized]))
+        else:
+            final_items = sorted_candidates[:max_candidates]
+
         return [
             {"plate": plate, "confidence": round(self._clamp(confidence), 4)}
-            for plate, confidence in sorted(
-                candidate_scores.items(),
-                key=lambda item: (item[1], self.matches_plate_pattern(item[0]), len(item[0])),
-                reverse=True,
-            )[:max_candidates]
+            for plate, confidence in final_items
         ]
 
     @classmethod
@@ -234,6 +300,34 @@ class PlateCandidateGenerator:
         suffix = normalized[8:]
         return registration_year >= 21 and serial_number > 0 and not any(character in {"I", "O"} for character in suffix)
 
+    def _state_pair_options(self, prefix: str) -> list[tuple[str, float, bool]]:
+        if len(prefix) < 2:
+            return []
+        p0, p1 = prefix[0].upper(), prefix[1].upper()
+        current = p0 + p1
+        if current in self.STATE_CODES:
+            return [(current, 0.0, False)]
+
+        candidates: dict[str, float] = {}
+        opts0 = [(p0, 0.0)] + self.STATE_POS0_CONFUSIONS.get(p0, [])
+        opts1 = [(p1, 0.0)] + self.STATE_POS1_CONFUSIONS.get(p1, [])
+
+        for c0, pen0 in opts0:
+            for c1, pen1 in opts1:
+                code = c0 + c1
+                if code in self.STATE_CODES:
+                    pen = pen0 + pen1
+                    if code not in candidates or pen < candidates[code]:
+                        candidates[code] = pen
+
+        if p1 in ("L", "1", "I") and "DL" in self.STATE_CODES:
+            candidates["DL"] = min(candidates.get("DL", 99.0), 0.03)
+
+        if p0 in ("7", "T") and p1 in ("5", "S") and "TS" in self.STATE_CODES:
+            candidates["TS"] = min(candidates.get("TS", 99.0), 0.03)
+
+        return [(code, pen, True) for code, pen in sorted(candidates.items(), key=lambda x: x[1])]
+
     def _forced_position_candidates(
         self,
         normalized: str,
@@ -242,50 +336,62 @@ class PlateCandidateGenerator:
         regex_boost_enabled: bool,
     ) -> list[tuple[str, float]]:
         candidates = []
+        if len(normalized) < 8:
+            return []
+
+        state_options = self._state_pair_options(normalized[:2])
+        if not state_options:
+            return []
+
         for rto_length in (2, 1):
+            if rto_length == 1 and len(normalized) >= 3 and normalized[1] in {"0", "O"} and normalized[2].isdigit():
+                continue
+
             series_length = len(normalized) - 2 - rto_length - 4
             if series_length < 1 or series_length > 3:
                 continue
 
-            layout = (
-                "state",
-                "state",
+            slots = (
                 *(["rto_digit"] * rto_length),
                 *(["series_letter"] * series_length),
                 *(["serial_digit"] * 4),
             )
             slot_options = [
                 self._slot_options(char, slot)
-                for char, slot in zip(normalized, layout)
+                for char, slot in zip(normalized[2:], slots)
             ]
             if any(not options for options in slot_options):
                 continue
 
-            for expanded in product(*slot_options):
-                candidate = "".join(option[0] for option in expanded)
-                if not self.matches_plate_pattern(candidate):
-                    continue
+            for state_code, state_pen, state_corr in state_options:
+                for expanded in product(*slot_options):
+                    remainder = "".join(option[0] for option in expanded)
+                    candidate = state_code + remainder
+                    if not self.matches_plate_pattern(candidate):
+                        continue
 
-                corrected_indexes = [index for index, option in enumerate(expanded) if option[2]]
-                correction_penalty = sum(float(option[1]) for option in expanded)
-                if corrected_indexes:
-                    average_uncertainty = sum(1.0 - char_confidences[index] for index in corrected_indexes) / len(
-                        corrected_indexes
-                    )
-                    uncertainty_bonus = average_uncertainty * 0.08
-                else:
-                    uncertainty_bonus = 0.0
-                structural_bonus = 0.22 if corrected_indexes else 0.04
-                if rto_length == 2:
-                    structural_bonus += 0.035
-                if series_length == 2:
-                    structural_bonus += 0.02
+                    corrected_indexes = [index for index, option in enumerate(expanded) if option[2]]
+                    correction_penalty = state_pen + sum(float(option[1]) for option in expanded)
+                    num_corrections = (1 if state_corr else 0) + len(corrected_indexes)
+                    if corrected_indexes:
+                        average_uncertainty = sum(
+                            1.0 - char_confidences[min(index + 2, len(char_confidences) - 1)]
+                            for index in corrected_indexes
+                        ) / len(corrected_indexes)
+                        uncertainty_bonus = average_uncertainty * 0.08
+                    else:
+                        uncertainty_bonus = 0.0
+                    structural_bonus = 0.22 if num_corrections == 0 else max(0.12, 0.22 - (num_corrections * 0.02))
+                    if rto_length == 2:
+                        structural_bonus += 0.035
+                    if series_length == 2:
+                        structural_bonus += 0.02
 
-                score = base_confidence + structural_bonus + uncertainty_bonus - correction_penalty
-                score += self._rto_pair_context_bonus(normalized, candidate, rto_length)
-                if regex_boost_enabled:
-                    score += self.REGEX_VALID_BOOST * 0.35
-                candidates.append((candidate, score))
+                    score = base_confidence + structural_bonus + uncertainty_bonus - correction_penalty
+                    score += self._rto_pair_context_bonus(normalized, candidate, rto_length)
+                    if regex_boost_enabled:
+                        score += self.REGEX_VALID_BOOST * 0.35
+                    candidates.append((candidate, score))
 
         return candidates
 
@@ -337,10 +443,15 @@ class PlateCandidateGenerator:
 
     @classmethod
     def _slot_options(cls, char: str, slot: str) -> list[tuple[str, float, bool]]:
-        if slot in {"state", "series_letter"}:
+        if slot == "series_letter":
+            if char in ("I", "O"):
+                return [(v, pen, True) for v, pen in cls.SERIES_LETTER_REPLACEMENTS.get(char, [])]
+            options = []
             if char.isalpha():
-                return [(char, 0.0, False)]
-            return [(value, penalty, True) for value, penalty in cls.LETTER_SLOT_REPLACEMENTS.get(char, [])]
+                options.append((char, 0.0, False))
+            for v, pen in cls.SERIES_LETTER_REPLACEMENTS.get(char, []):
+                options.append((v, pen, True))
+            return options
 
         if slot == "rto_digit":
             if char.isdigit():

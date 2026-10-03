@@ -59,6 +59,35 @@ class PlateCandidateGeneratorTest(unittest.TestCase):
 
         self.assertEqual(candidates[0]["plate"], "DL7CQ1939")
 
+    def test_corrects_il_state_prefix_to_delhi(self) -> None:
+        candidates = self.generator.generate("IL7CQ1939", 0.47)
+
+        self.assertEqual(candidates[0]["plate"], "DL7CQ1939")
+        self.assertTrue(self.generator.matches_plate_pattern(candidates[0]["plate"]))
+
+    def test_corrects_prohibited_letter_in_series_to_q(self) -> None:
+        candidates = self.generator.generate("HR26DO5551", 0.57)
+
+        self.assertEqual(candidates[0]["plate"], "HR26DQ5551")
+        self.assertTrue(self.generator.matches_plate_pattern(candidates[0]["plate"]))
+
+    def test_valid_candidates_filter_out_invalid_permutations(self) -> None:
+        candidates = self.generator.generate("AP09CH1161", 0.59)
+
+        self.assertEqual(candidates[0]["plate"], "AP09CH1161")
+        for candidate in candidates[:-1]:
+            self.assertTrue(self.generator.matches_plate_pattern(candidate["plate"]))
+
+
+    def test_replaces_series_q_and_d_confusions(self) -> None:
+        candidates = self.generator.generate("HR26QQ5551", 0.70)
+        plates = [c["plate"] for c in candidates]
+        self.assertIn("HR26DQ5551", plates)
+
+    def test_corrects_telangana_prefix_75_to_ts(self) -> None:
+        candidates = self.generator.generate("7509FA5499", 0.50)
+        self.assertEqual(candidates[0]["plate"], "TS09FA5499")
+
 
 if __name__ == "__main__":
     unittest.main()

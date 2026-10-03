@@ -705,6 +705,12 @@ class OCRService:
         if len(cleaned_text) <= 10:
             return cleaned_text, char_confidences
 
+        for prefix_len in (4, 5, 3, 2):
+            if len(cleaned_text) - prefix_len in (8, 9, 10):
+                cand_slice = cleaned_text[prefix_len:]
+                if PlateCandidateGenerator.matches_plate_pattern(cand_slice):
+                    return cand_slice, char_confidences[prefix_len:]
+
         edge_confusables = {"I", "1", "0", "O", "L"}
         options = [(cleaned_text, char_confidences)]
         if cleaned_text[0] in edge_confusables:
@@ -786,10 +792,17 @@ class OCRService:
                 "candidates": candidates,
             }
 
+        best_candidate = candidates[0]
+        alternates = [
+            cand
+            for cand in candidates[1 : self.MAX_ALTERNATE_CANDIDATES + 1]
+            if cand["plate"] != best_candidate["plate"]
+        ]
+
         return {
             "text": plate_text,
-            "ocr_confidence": candidates[0]["confidence"],
-            "candidates": candidates,
+            "ocr_confidence": best_candidate["confidence"],
+            "candidates": alternates,
         }
 
     @classmethod
@@ -830,7 +843,7 @@ class OCRService:
             return tokens
 
         crop_right_edge = max(float(token["right_x"]) for token in tokens)
-        marker_limit = max(36.0, crop_right_edge * 0.18)
+        marker_limit = max(36.0, crop_right_edge * 0.22)
         has_plate_like_token_to_right = any(
             float(token["center_x"]) > marker_limit
             and (
@@ -842,22 +855,24 @@ class OCRService:
         return [
             token
             for token in tokens
-            if not (
-                len(str(token["text"])) == 1
-                and str(token["text"]) in {"I", "1", "0", "O"}
+            if not OCRService._is_country_marker(str(token["text"]))
+            and not (
+                len(str(token["text"])) <= 2
+                and str(token["text"]) in {"I", "1", "0", "O", "L", "IN"}
                 and float(token["center_x"]) <= marker_limit
             )
             and not (
                 has_plate_like_token_to_right
                 and float(token["center_x"]) <= marker_limit
-                and float(token["confidence"]) < 0.45
-                and len(str(token["text"])) <= 3
+                and (float(token["confidence"]) < 0.65 or len(str(token["text"])) <= 4)
+                and OCRService._is_country_marker(str(token["text"]))
             )
         ]
 
     @staticmethod
     def _is_country_marker(text: str) -> bool:
-        return text in {"IND", "IIND", "IN", "ND"}
+        cleaned = re.sub(r"[^A-Z0-9]", "", text.upper())
+        return bool(re.fullmatch(r"(?:I{0,2}1?ND[I1A]?|INDIA|IND|IN|ND|MD)", cleaned))
 
     @staticmethod
     def _group_tokens_into_rows(tokens: list[dict]) -> list[list[dict]]:
@@ -898,6 +913,19 @@ class OCRService:
         cleaned_text = cls._normalize_plate_text(text)
         if len(cleaned_text) < 8:
             return 0
+
+        prefix_match = re.match(r"^(?:I{0,2}1?ND[I1A]?|INDIA|IND|IN|ND)", cleaned_text)
+        if prefix_match:
+            prefix_len = prefix_match.end()
+            remainder = cleaned_text[prefix_len:]
+            if len(remainder) >= 7:
+                rem_prefix = remainder[:2]
+                if (
+                    rem_prefix in cls.INDIAN_STATE_CODES
+                    or rem_prefix[1] == "L"
+                    or rem_prefix in ("75", "7S", "IL", "1L", "JL")
+                ):
+                    return prefix_len
 
         if cleaned_text.startswith("IND") and cleaned_text[3:5] in cls.INDIAN_STATE_CODES:
             return 3
@@ -1151,6 +1179,10 @@ class OCRService:
             reverse=True,
         )
 
+        has_valid = any(candidate["_is_valid_plate"] for candidate in ranked_candidates)
+        if has_valid:
+            ranked_candidates = [c for c in ranked_candidates if c["_is_valid_plate"]]
+
         return [
             {
                 "plate": str(candidate["plate"]),
@@ -1204,6 +1236,10 @@ class OCRService:
                 )[: self.MAX_ALTERNATE_CANDIDATES]
             ]
 
+        has_valid = any(PlateCandidateGenerator.matches_plate_pattern(str(c["plate"])) for c in candidates)
+        if has_valid:
+            candidates = [c for c in candidates if PlateCandidateGenerator.matches_plate_pattern(str(c["plate"]))]
+
         needs_validator_recovery = len(cleaned_text) > 10 or not any(
             PlateCandidateGenerator.matches_plate_pattern(str(candidate["plate"]))
             for candidate in candidates
@@ -1244,8 +1280,8 @@ class OCRService:
             for plate, confidence in sorted(
                 merged_candidates.items(),
                 key=lambda item: (
-                    item[1],
                     PlateCandidateGenerator.matches_plate_pattern(item[0]),
+                    item[1],
                     len(item[0]),
                 ),
                 reverse=True,
@@ -1255,40 +1291,50 @@ class OCRService:
     @classmethod
     def _missing_state_prefix_candidates(cls, text: str, base_confidence: float) -> list[dict[str, str | float]]:
         normalized = cls._normalize_plate_text(text)
-        if len(normalized) < 8 or not re.fullmatch(r"[A-Z][0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}", normalized):
+        if len(normalized) < 7:
             return []
 
-        visible_state_char = normalized[0]
-        remainder_after_visible = normalized[1:]
         common_state_priority = {
+            "MH": 0.09,
+            "DL": 0.08,
             "TS": 0.08,
             "KA": 0.07,
-            "MH": 0.07,
             "AP": 0.06,
-            "DL": 0.06,
             "TN": 0.05,
             "HR": 0.05,
+            "UP": 0.05,
+            "GJ": 0.04,
             "KL": 0.04,
-            "UP": 0.04,
+            "WB": 0.04,
         }
         candidate_scores: dict[str, float] = {}
 
-        for state_code in cls.INDIAN_STATE_CODES:
-            possible_plates = []
-            if state_code[0] == visible_state_char:
-                possible_plates.append(state_code + remainder_after_visible)
-            if state_code[1] == visible_state_char:
-                possible_plates.append(state_code[0] + normalized)
+        if re.fullmatch(r"[A-Z][0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}", normalized):
+            visible_state_char = normalized[0]
+            remainder_after_visible = normalized[1:]
+            for state_code in cls.INDIAN_STATE_CODES:
+                possible_plates = []
+                if state_code[0] == visible_state_char:
+                    possible_plates.append(state_code + remainder_after_visible)
+                if state_code[1] == visible_state_char:
+                    possible_plates.append(state_code[0] + normalized)
 
-            for plate in possible_plates:
-                if not PlateCandidateGenerator.matches_plate_pattern(plate):
-                    continue
+                for plate in possible_plates:
+                    if not PlateCandidateGenerator.matches_plate_pattern(plate):
+                        continue
 
-                confidence = min(
-                    0.92,
-                    (base_confidence * 0.82) + common_state_priority.get(state_code, 0.0),
-                )
-                candidate_scores[plate] = max(candidate_scores.get(plate, 0.0), confidence)
+                    confidence = min(
+                        0.92,
+                        (base_confidence * 0.82) + common_state_priority.get(state_code, 0.0),
+                    )
+                    candidate_scores[plate] = max(candidate_scores.get(plate, 0.0), confidence)
+
+        elif re.fullmatch(r"[0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}", normalized):
+            for state_code in sorted(common_state_priority.keys(), key=lambda s: common_state_priority[s], reverse=True):
+                candidate = state_code + normalized
+                if PlateCandidateGenerator.matches_plate_pattern(candidate):
+                    conf = min(0.88, (base_confidence * 0.78) + common_state_priority[state_code])
+                    candidate_scores[candidate] = max(candidate_scores.get(candidate, 0.0), conf)
 
         return [
             {"plate": plate, "confidence": round(confidence, 4)}

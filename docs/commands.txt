@@ -1,0 +1,3 @@
+PS C:\Projects\LPR\backend> .\run.ps1 
+
+PS C:\Projects\LPR\frontend> npm.cmd run dev
